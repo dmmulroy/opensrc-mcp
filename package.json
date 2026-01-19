@@ -1,0 +1,29 @@
+{
+  "name": "opensrc-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for fetching and querying dependency source code",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "bin": {
+    "opensrc-mcp": "dist/index.mjs"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsdown src/index.ts --format esm --shims",
+    "dev": "tsdown src/index.ts --format esm --shims --watch",
+    "start": "node dist/index.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["mcp", "model-context-protocol", "opensrc", "source-code", "ai", "llm"],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@types/node": "^22.0.0",
+    "fast-glob": "^3.3.2",
+    "opensrc": "^0.6.0",
+    "tsdown": "^0.20.0-beta.3",
+    "typescript": "^5.8.0",
+    "zod": "^3.24.0"
+  }
+}
