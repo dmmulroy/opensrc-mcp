@@ -43,8 +43,8 @@ export async function readSources(projectDir: string): Promise<Source[]> {
         name: pkg.name,
         version: pkg.version,
         path: pkg.path.replace(/^opensrc\//, ""),
-        fetchedAt: new Date().toISOString(),
-        repository: "",
+        fetchedAt: pkg.fetchedAt ?? new Date().toISOString(),
+        repository: pkg.repository ?? "",
       });
     }
 
@@ -103,8 +103,14 @@ export async function writeSources(
     return sourceNames.has(repo.name ?? "");
   });
 
+  // Update timestamp per opensrc format
+  const output = {
+    ...existing,
+    updatedAt: new Date().toISOString(),
+  };
+
   const { writeFile } = await import("node:fs/promises");
-  await writeFile(sourcesPath, JSON.stringify(existing, null, 2), "utf8");
+  await writeFile(sourcesPath, JSON.stringify(output, null, 2), "utf8");
 }
 
 /**

@@ -1,16 +1,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Source } from "./types.js";
-import { createExecutor, type SearchAPI, type ExecuteAPI } from "./executor.js";
-import { createSearchAPI } from "./api/search.js";
-import { createExecuteAPI } from "./api/execute.js";
+import { createExecutor } from "./executor.js";
+import { createOpensrcAPI } from "./api/opensrc.js";
 import { truncate } from "./truncate.js";
 import pkg from "../package.json" with { type: "json" };
 
 /**
- * Type declarations exposed to agent in tool descriptions
+ * Type declarations exposed to agent in tool description
  */
-const SEARCH_TYPES = `
+const TYPES = `
 interface Source {
   type: "npm" | "pypi" | "crates" | "repo";
   name: string;
@@ -42,10 +41,35 @@ interface ParsedSpec {
   repoUrl?: string;
 }
 
+type FetchResult =
+  | { success: true; source: Source; alreadyExists: boolean }
+  | { success: false; error: string };
+
+interface RemoveResult {
+  success: boolean;
+  removed: string[];
+}
+
+interface SearchResult {
+  source: string;
+  file: string;
+  identifier: string;
+  kind: string;
+  startLine: number;
+  endLine: number;
+  content: string;
+  score: number;
+}
+
+type SearchResponse =
+  | SearchResult[]
+  | { error: "not_indexed"; sources: string[] };
+
 declare const sources: Source[];
 declare const cwd: string;
 
 declare const opensrc: {
+  // Read operations
   list(): Source[];
   has(name: string, version?: string): boolean;
   get(name: string): Source | undefined;
@@ -57,33 +81,14 @@ declare const opensrc: {
   }): Promise<GrepResult[]>;
   read(sourceName: string, filePath: string): Promise<string>;
   resolve(spec: string): Promise<ParsedSpec>;
-};
-`;
 
-const EXECUTE_TYPES = `
-interface Source {
-  type: "npm" | "pypi" | "crates" | "repo";
-  name: string;
-  version?: string;
-  ref?: string;
-  path: string;
-  fetchedAt: string;
-  repository: string;
-}
+  // Semantic search (vector-based)
+  search(query: string, options?: {
+    sources?: string[];
+    topK?: number;
+  }): Promise<SearchResponse>;
 
-interface FetchResult {
-  success: boolean;
-  source?: Source;
-  error?: string;
-  alreadyExists?: boolean;
-}
-
-interface RemoveResult {
-  success: boolean;
-  removed: string[];
-}
-
-declare const opensrc: {
+  // Mutation operations
   fetch(specs: string | string[], options?: {
     modify?: boolean;
   }): Promise<FetchResult[]>;
@@ -99,11 +104,76 @@ declare const opensrc: {
 };
 `;
 
-const SEARCH_EXAMPLES = `
+const PACKAGE_FORMATS = `
+Fetch spec formats (input to opensrc.fetch):
+- zod               -> npm package (latest or lockfile version)
+- zod@3.22.0        -> npm specific version  
+- pypi:requests     -> Python/PyPI package
+- crates:serde      -> Rust/crates.io package
+- vercel/ai         -> GitHub repo (default branch)
+- vercel/ai@v3.0.0  -> GitHub repo at tag/branch/commit
+
+Source names (returned in FetchResult.source.name, used for search/read):
+- npm packages:  "zod", "drizzle-orm", "@tanstack/react-query"
+- pypi packages: "requests", "numpy"  
+- crates:        "serde", "tokio"
+- GitHub repos:  "github.com/vercel/ai", "github.com/anthropics/sdk"
+- GitLab repos:  "gitlab.com/owner/repo"
+
+IMPORTANT: After fetching, always use result.source.name for subsequent API calls.
+`;
+
+const EXAMPLES = `
 // List all fetched sources and their names
 async () => {
   const sources = opensrc.list();
   return sources.map(s => ({ name: s.name, type: s.type, version: s.version || s.ref }));
+}
+
+// Fetch a package and get its source name for subsequent searches
+async () => {
+  const results = await opensrc.fetch("zod");
+  const result = results[0];
+  
+  if (!result.success) return { error: result.error };
+  
+  // Use source.name in future search calls
+  // For npm: name is "zod"
+  // For repos: name is "github.com/owner/repo"
+  return { 
+    sourceName: result.source.name,
+    type: result.source.type,
+    path: result.source.path 
+  };
+}
+
+// Fetch a GitHub repo and immediately explore its structure
+async () => {
+  const results = await opensrc.fetch("vercel/ai");
+  const result = results[0];
+  
+  if (!result.success) return { error: result.error };
+  
+  // Repo source names include the host: "github.com/vercel/ai"
+  const sourceName = result.source.name;
+  
+  // Now read key files
+  const files = await opensrc.readMany(sourceName, [
+    "package.json",
+    "README.md",
+    "src/index.ts"
+  ]);
+  
+  return { sourceName, files };
+}
+
+// Fetch multiple packages at once
+async () => {
+  const results = await opensrc.fetch(["zod", "drizzle-orm", "hono"]);
+  return results.map(r => r.success 
+    ? { name: r.source.name, success: true }
+    : { error: r.error, success: false }
+  );
 }
 
 // Find where a function is defined, then read the implementation
@@ -145,55 +215,6 @@ async () => {
   const matches = await opensrc.grep("^export ", { sources: ["hono"], include: "src/**/*.ts" });
   return matches.map(m => m.content);
 }
-`;
-
-const EXECUTE_EXAMPLES = `
-// Fetch a package and get its source name for subsequent searches
-async () => {
-  const results = await opensrc.fetch("zod");
-  const result = results[0];
-  
-  if (!result.success) return { error: result.error };
-  
-  // Use source.name in future search calls
-  // For npm: name is "zod"
-  // For repos: name is "github.com/owner/repo"
-  return { 
-    sourceName: result.source.name,
-    type: result.source.type,
-    path: result.source.path 
-  };
-}
-
-// Fetch a GitHub repo and immediately explore its structure
-async () => {
-  const results = await opensrc.fetch("vercel/ai");
-  const result = results[0];
-  
-  if (!result.success) return { error: result.error };
-  
-  // Repo source names include the host: "github.com/vercel/ai"
-  const sourceName = result.source.name;
-  
-  // Now read key files
-  const files = await opensrc.readMany(sourceName, [
-    "package.json",
-    "README.md",
-    "src/index.ts"
-  ]);
-  
-  return { sourceName, files };
-}
-
-// Fetch multiple packages at once
-async () => {
-  const results = await opensrc.fetch(["zod", "drizzle-orm", "hono"]);
-  return results.map(r => ({
-    name: r.source?.name,
-    success: r.success,
-    error: r.error
-  }));
-}
 
 // Batch read related files from a source
 async () => {
@@ -219,25 +240,44 @@ async () => {
   
   return "Cleaned";
 }
-`;
 
-const PACKAGE_FORMATS = `
-Fetch spec formats (input to opensrc.fetch):
-- zod               -> npm package (latest or lockfile version)
-- zod@3.22.0        -> npm specific version  
-- pypi:requests     -> Python/PyPI package
-- crates:serde      -> Rust/crates.io package
-- vercel/ai         -> GitHub repo (default branch)
-- vercel/ai@v3.0.0  -> GitHub repo at tag/branch/commit
+// Semantic search: find code by meaning, not exact text
+async () => {
+  // Search for code related to "parsing user input and validating schema"
+  const results = await opensrc.search("parse and validate user input", {
+    sources: ["zod"],
+    topK: 10
+  });
+  
+  // Returns SearchResult[] or { error: "not_indexed", sources: [...] }
+  if ("error" in results) {
+    return { error: results.error, notIndexed: results.sources };
+  }
+  
+  return results.map(r => ({
+    source: r.source,
+    file: r.file,
+    identifier: r.identifier,
+    kind: r.kind,
+    lines: \`\${r.startLine}-\${r.endLine}\`,
+    score: r.score.toFixed(3)
+  }));
+}
 
-Source names (returned in FetchResult.source.name, used for search/read):
-- npm packages:  "zod", "drizzle-orm", "@tanstack/react-query"
-- pypi packages: "requests", "numpy"  
-- crates:        "serde", "tokio"
-- GitHub repos:  "github.com/vercel/ai", "github.com/anthropics/sdk"
-- GitLab repos:  "gitlab.com/owner/repo"
-
-IMPORTANT: After fetching, always use result.source.name for subsequent API calls.
+// Search across all indexed sources
+async () => {
+  const results = await opensrc.search("error handling and retry logic");
+  if ("error" in results) return results;
+  
+  // Read the top result's full content
+  if (results.length > 0) {
+    const top = results[0];
+    const content = await opensrc.read(top.source, top.file);
+    const lines = content.split("\\n");
+    return lines.slice(top.startLine - 1, top.endLine).join("\\n");
+  }
+  return "No results";
+}
 `;
 
 /**
@@ -253,75 +293,33 @@ export function createServer(
     version: pkg.version,
   });
 
-  // Create APIs
-  const searchAPI: SearchAPI = createSearchAPI(projectDir, getSources);
-  const executeAPI: ExecuteAPI = createExecuteAPI(
-    projectDir,
-    getSources,
-    updateSources
-  );
+  // Create unified API
+  const api = createOpensrcAPI(projectDir, getSources, updateSources);
 
-  // Create executors
-  const searchExecutor = createExecutor({
+  // Create executor
+  const executor = createExecutor({
     projectDir,
     getSources,
-    mode: "search",
-    api: searchAPI,
+    api,
   });
 
-  const executeExecutor = createExecutor({
-    projectDir,
-    getSources,
-    mode: "execute",
-    api: executeAPI,
-  });
-
-  // Register search tool
-  server.tool(
-    "search",
-    `Query fetched source code without consuming context. Data stays server-side.
-
-Types:
-${SEARCH_TYPES}
-
-Examples:
-${SEARCH_EXAMPLES}`,
-    {
-      code: z.string().describe("JavaScript async arrow function to execute"),
-    },
-    async ({ code }) => {
-      const result = await searchExecutor(code);
-
-      if (result.error) {
-        return {
-          content: [{ type: "text", text: `Error: ${result.error}` }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: truncate(result.result) }],
-      };
-    }
-  );
-
-  // Register execute tool
+  // Register single unified tool
   server.tool(
     "execute",
-    `Perform mutations: fetch packages/repos, remove, clean, batch read.
+    `Query and mutate fetched source code. Data stays server-side.
 
 Types:
-${EXECUTE_TYPES}
+${TYPES}
 
 ${PACKAGE_FORMATS}
 
 Examples:
-${EXECUTE_EXAMPLES}`,
+${EXAMPLES}`,
     {
       code: z.string().describe("JavaScript async arrow function to execute"),
     },
     async ({ code }) => {
-      const result = await executeExecutor(code);
+      const result = await executor(code);
 
       if (result.error) {
         return {

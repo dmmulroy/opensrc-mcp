@@ -2,7 +2,8 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
-import { readSources, writeSources } from "./sources.js";
+import { readSources, writeSources, getOpensrcDir } from "./sources.js";
+import { initVector, shutdownVector } from "./vector/index.js";
 import type { Source } from "./types.js";
 
 /**
@@ -11,6 +12,7 @@ import type { Source } from "./types.js";
 async function main() {
   // Determine project directory (current working directory)
   const projectDir = process.cwd();
+  const opensrcDir = getOpensrcDir(projectDir);
 
   // State: sources list
   let sources: Source[] = await readSources(projectDir);
@@ -20,6 +22,11 @@ async function main() {
     sources = newSources;
   };
 
+  // Initialize vector search worker (non-blocking, continues in background)
+  initVector(opensrcDir).catch((err) => {
+    console.error("Failed to initialize vector search:", err);
+  });
+
   // Create MCP server
   const server = createServer(projectDir, getSources, updateSources);
 
@@ -28,15 +35,14 @@ async function main() {
   await server.connect(transport);
 
   // Handle graceful shutdown
-  process.on("SIGINT", async () => {
+  const shutdown = async () => {
     await writeSources(projectDir, sources);
+    await shutdownVector();
     process.exit(0);
-  });
+  };
 
-  process.on("SIGTERM", async () => {
-    await writeSources(projectDir, sources);
-    process.exit(0);
-  });
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 main().catch((err) => {

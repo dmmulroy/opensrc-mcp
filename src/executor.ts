@@ -1,5 +1,6 @@
-import { createContext, Script, type Context } from "node:vm";
+import { createContext, runInContext, Script, type Context } from "node:vm";
 import type { Source, ExecutorResult } from "./types.js";
+import type { OpensrcAPI } from "./api/opensrc.js";
 
 /**
  * Deep freeze an object to prevent modification
@@ -17,68 +18,30 @@ function deepFreeze<T>(obj: T): T {
   return Object.freeze(obj);
 }
 
-export type SearchAPI = {
-  list: () => Source[];
-  has: (name: string, version?: string) => boolean;
-  get: (name: string) => Source | undefined;
-  files: (
-    sourceName: string,
-    glob?: string
-  ) => Promise<Array<{ path: string; size: number; isDirectory: boolean }>>;
-  grep: (
-    pattern: string,
-    options?: { sources?: string[]; include?: string; maxResults?: number }
-  ) => Promise<
-    Array<{ source: string; file: string; line: number; content: string }>
-  >;
-  read: (sourceName: string, filePath: string) => Promise<string>;
-  resolve: (spec: string) => Promise<{
-    type: "npm" | "pypi" | "crates" | "repo";
-    name: string;
-    version?: string;
-    ref?: string;
-    repoUrl?: string;
-  }>;
-};
-
-export type ExecuteAPI = {
-  fetch: (
-    specs: string | string[],
-    options?: { modify?: boolean }
-  ) => Promise<
-    Array<{
-      success: boolean;
-      source?: Source;
-      error?: string;
-      alreadyExists?: boolean;
-    }>
-  >;
-  remove: (names: string[]) => Promise<{ success: boolean; removed: string[] }>;
-  clean: (options?: {
-    packages?: boolean;
-    repos?: boolean;
-    npm?: boolean;
-    pypi?: boolean;
-    crates?: boolean;
-  }) => Promise<{ success: boolean; removed: string[] }>;
-  readMany: (
-    sourceName: string,
-    paths: string[]
-  ) => Promise<Record<string, string>>;
-};
+/**
+ * Code to freeze built-in prototypes in the VM context.
+ * Prevents prototype pollution attacks from persisting across requests.
+ */
+const PROTOTYPE_FREEZE_CODE = `
+  Object.freeze(Object.prototype);
+  Object.freeze(Array.prototype);
+  Object.freeze(String.prototype);
+  Object.freeze(Number.prototype);
+  Object.freeze(Boolean.prototype);
+  Object.freeze(Function.prototype);
+`;
 
 interface ExecutorOptions {
   projectDir: string;
   getSources: () => Source[];
-  mode: "search" | "execute";
-  api: SearchAPI | ExecuteAPI;
+  api: OpensrcAPI;
 }
 
 /**
  * Create a sandboxed code executor
  */
 export function createExecutor(options: ExecutorOptions) {
-  const { getSources, projectDir, mode, api } = options;
+  const { getSources, projectDir, api } = options;
 
   return async (code: string): Promise<ExecutorResult> => {
     // Build frozen context with injected API
@@ -103,6 +66,7 @@ export function createExecutor(options: ExecutorOptions) {
         values: Object.values,
         entries: Object.entries,
         fromEntries: Object.fromEntries,
+        freeze: Object.freeze,
       }),
       Array: Object.freeze({ isArray: Array.isArray }),
       Promise: Promise,
@@ -117,10 +81,15 @@ export function createExecutor(options: ExecutorOptions) {
       globalThis: undefined,
     });
 
+    // Freeze built-in prototypes to prevent pollution
+    runInContext(PROTOTYPE_FREEZE_CODE, context);
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
     try {
       // Compile script
       const script = new Script(`(${code})()`, {
-        filename: `agent-code-${mode}.js`,
+        filename: "agent-code.js",
       });
 
       // Execute and await result
@@ -129,20 +98,24 @@ export function createExecutor(options: ExecutorOptions) {
         breakOnSigint: true,
       });
 
-      // Handle async results with timeout
+      // Handle async results with timeout (clear timer to prevent leak)
       const result = await Promise.race([
         resultPromise,
-        new Promise((_, reject) =>
-          setTimeout(
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(
             () => reject(new Error("Execution timeout (30s)")),
             30000
-          )
-        ),
+          );
+        }),
       ]);
 
       return { result };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+      }
     }
   };
 }

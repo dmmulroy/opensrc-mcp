@@ -42,14 +42,11 @@ export interface ParsedSpec {
 }
 
 /**
- * Result of a fetch operation
+ * Result of a fetch operation (discriminated union for type safety)
  */
-export interface FetchResult {
-  success: boolean;
-  source?: Source;
-  error?: string;
-  alreadyExists?: boolean;
-}
+export type FetchResult =
+  | { success: true; source: Source; alreadyExists: boolean }
+  | { success: false; error: string };
 
 /**
  * Result of remove/clean operations
@@ -57,14 +54,6 @@ export interface FetchResult {
 export interface RemoveResult {
   success: boolean;
   removed: string[];
-}
-
-/**
- * Sources manifest stored in opensrc/sources.json
- */
-export interface SourcesManifest {
-  sources: Source[];
-  version: number;
 }
 
 /**
