@@ -5,6 +5,7 @@ import { createExecutor, type SearchAPI, type ExecuteAPI } from "./executor.js";
 import { createSearchAPI } from "./api/search.js";
 import { createExecuteAPI } from "./api/execute.js";
 import { truncate } from "./truncate.js";
+import pkg from "../package.json" with { type: "json" };
 
 /**
  * Type declarations exposed to agent in tool descriptions
@@ -248,8 +249,8 @@ export function createServer(
   updateSources: (sources: Source[]) => void
 ): McpServer {
   const server = new McpServer({
-    name: "opensrc-mcp",
-    version: "0.1.2",
+    name: pkg.name,
+    version: pkg.version,
   });
 
   // Create APIs
