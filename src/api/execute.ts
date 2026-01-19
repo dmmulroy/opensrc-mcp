@@ -51,11 +51,13 @@ async function loadOpensrcSources(projectDir: string): Promise<Source[]> {
     for (const repo of data.repos ?? []) {
       sources.push({
         type: "repo",
-        name: repo.displayName ?? `${repo.owner}-${repo.repo}`,
-        ref: repo.ref,
+        name: repo.name,
+        ref: repo.version,
         path: repo.path.replace(/^opensrc\//, ""),
-        fetchedAt: new Date().toISOString(),
-        repository: `https://${repo.host}/${repo.owner}/${repo.repo}`,
+        fetchedAt: repo.fetchedAt ?? new Date().toISOString(),
+        repository: repo.name.startsWith("github.com")
+          ? `https://${repo.name}`
+          : `https://github.com/${repo.name}`,
       });
     }
 

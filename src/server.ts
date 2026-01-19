@@ -99,61 +99,144 @@ declare const opensrc: {
 `;
 
 const SEARCH_EXAMPLES = `
-// List all fetched sources
-async () => opensrc.list()
+// List all fetched sources and their names
+async () => {
+  const sources = opensrc.list();
+  return sources.map(s => ({ name: s.name, type: s.type, version: s.version || s.ref }));
+}
 
-// Check if zod is fetched
-async () => opensrc.has("zod")
+// Find where a function is defined, then read the implementation
+async () => {
+  const matches = await opensrc.grep("export function parse", { sources: ["zod"], include: "*.ts" });
+  if (matches.length === 0) return "No matches found";
+  
+  const match = matches[0];
+  const content = await opensrc.read(match.source, match.file);
+  const lines = content.split("\\n");
+  
+  // Return 30 lines starting from the match
+  return lines.slice(match.line - 1, match.line + 29).join("\\n");
+}
 
-// Find all TypeScript files in zod source
-async () => opensrc.files("zod", "**/*.ts")
+// Search across all sources for error handling patterns
+async () => {
+  const results = await opensrc.grep("catch|throw new Error", { include: "*.ts", maxResults: 20 });
+  return results.map(r => \`\${r.source}:\${r.file}:\${r.line} - \${r.content}\`);
+}
 
-// Search for "parse" in zod source
-async () => opensrc.grep("parse", { sources: ["zod"], include: "*.ts" })
+// Explore a repo's structure and read key files
+async () => {
+  // Source names for repos are like "github.com/owner/repo"
+  const name = "github.com/vercel/ai";
+  
+  // Find entry points
+  const files = await opensrc.files(name, "**/{index,main,mod}.{ts,js}");
+  
+  // Read the first entry point found
+  if (files.length > 0) {
+    return await opensrc.read(name, files[0].path);
+  }
+  return "No entry point found";
+}
 
-// Read zod's main index
-async () => opensrc.read("zod", "src/index.ts")
-
-// Resolve a package spec without fetching
-async () => opensrc.resolve("@tanstack/react-query@5.0.0")
+// Find all exports from a package
+async () => {
+  const matches = await opensrc.grep("^export ", { sources: ["hono"], include: "src/**/*.ts" });
+  return matches.map(m => m.content);
+}
 `;
 
 const EXECUTE_EXAMPLES = `
-// Fetch a single npm package
-async () => opensrc.fetch("zod")
+// Fetch a package and get its source name for subsequent searches
+async () => {
+  const results = await opensrc.fetch("zod");
+  const result = results[0];
+  
+  if (!result.success) return { error: result.error };
+  
+  // Use source.name in future search calls
+  // For npm: name is "zod"
+  // For repos: name is "github.com/owner/repo"
+  return { 
+    sourceName: result.source.name,
+    type: result.source.type,
+    path: result.source.path 
+  };
+}
 
-// Fetch multiple packages
-async () => opensrc.fetch(["zod", "drizzle-orm", "hono"])
+// Fetch a GitHub repo and immediately explore its structure
+async () => {
+  const results = await opensrc.fetch("vercel/ai");
+  const result = results[0];
+  
+  if (!result.success) return { error: result.error };
+  
+  // Repo source names include the host: "github.com/vercel/ai"
+  const sourceName = result.source.name;
+  
+  // Now read key files
+  const files = await opensrc.readMany(sourceName, [
+    "package.json",
+    "README.md",
+    "src/index.ts"
+  ]);
+  
+  return { sourceName, files };
+}
 
-// Fetch a GitHub repo at specific ref
-async () => opensrc.fetch("vercel/ai@v3.0.0")
+// Fetch multiple packages at once
+async () => {
+  const results = await opensrc.fetch(["zod", "drizzle-orm", "hono"]);
+  return results.map(r => ({
+    name: r.source?.name,
+    success: r.success,
+    error: r.error
+  }));
+}
 
-// Fetch PyPI package
-async () => opensrc.fetch("pypi:requests==2.31.0")
+// Batch read related files from a source
+async () => {
+  const files = await opensrc.readMany("zod", [
+    "src/index.ts",
+    "src/types.ts", 
+    "src/ZodError.ts",
+    "src/helpers/parseUtil.ts"
+  ]);
+  
+  // files is Record<string, string> - path -> content
+  return Object.keys(files).filter(path => !files[path].startsWith("[Error:"));
+}
 
-// Remove a package
-async () => opensrc.remove(["zod"])
-
-// Clean all npm packages
-async () => opensrc.clean({ npm: true })
-
-// Read multiple files at once
-async () => opensrc.readMany("zod", ["src/index.ts", "src/types.ts"])
+// Clean up: remove specific sources or by type
+async () => {
+  // Remove specific packages
+  await opensrc.remove(["zod", "github.com/vercel/ai"]);
+  
+  // Or clean by type
+  // await opensrc.clean({ repos: true });  // remove all repos
+  // await opensrc.clean({ npm: true });    // remove all npm packages
+  
+  return "Cleaned";
+}
 `;
 
 const PACKAGE_FORMATS = `
-Package formats:
-- <name>            -> npm (auto-detects version from lockfile)
-- <name>@<version>  -> npm specific version
-- npm:<name>        -> explicit npm
-- pypi:<name>       -> Python/PyPI
-- pip:<name>        -> alias for pypi
-- crates:<name>     -> Rust/crates.io
-- cargo:<name>      -> alias for crates
-- owner/repo        -> GitHub repo
-- owner/repo@ref    -> GitHub at ref
-- github:owner/repo -> explicit GitHub
-- gitlab:owner/repo -> GitLab repo
+Fetch spec formats (input to opensrc.fetch):
+- zod               -> npm package (latest or lockfile version)
+- zod@3.22.0        -> npm specific version  
+- pypi:requests     -> Python/PyPI package
+- crates:serde      -> Rust/crates.io package
+- vercel/ai         -> GitHub repo (default branch)
+- vercel/ai@v3.0.0  -> GitHub repo at tag/branch/commit
+
+Source names (returned in FetchResult.source.name, used for search/read):
+- npm packages:  "zod", "drizzle-orm", "@tanstack/react-query"
+- pypi packages: "requests", "numpy"  
+- crates:        "serde", "tokio"
+- GitHub repos:  "github.com/vercel/ai", "github.com/anthropics/sdk"
+- GitLab repos:  "gitlab.com/owner/repo"
+
+IMPORTANT: After fetching, always use result.source.name for subsequent API calls.
 `;
 
 /**

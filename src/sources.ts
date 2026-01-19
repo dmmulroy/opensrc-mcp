@@ -49,14 +49,17 @@ export async function readSources(projectDir: string): Promise<Source[]> {
     }
 
     // Convert opensrc repo format to our Source format
+    // RepoEntry has: name (e.g. "github.com/owner/repo"), version (ref), path, fetchedAt
     for (const repo of data.repos ?? []) {
       sources.push({
         type: "repo",
-        name: repo.displayName ?? `${repo.owner}-${repo.repo}`,
-        ref: repo.ref,
+        name: repo.name,
+        ref: repo.version,
         path: repo.path.replace(/^opensrc\//, ""),
-        fetchedAt: new Date().toISOString(),
-        repository: `https://${repo.host}/${repo.owner}/${repo.repo}`,
+        fetchedAt: repo.fetchedAt ?? new Date().toISOString(),
+        repository: repo.name.startsWith("github.com")
+          ? `https://${repo.name}`
+          : `https://github.com/${repo.name}`,
       });
     }
 
@@ -96,8 +99,8 @@ export async function writeSources(
     return sourceNames.has(pkg.name ?? "");
   });
   existing.repos = (existing.repos ?? []).filter((r) => {
-    const repo = r as { displayName?: string; owner?: string; repo?: string };
-    return sourceNames.has(repo.displayName ?? `${repo.owner}-${repo.repo}`);
+    const repo = r as { name?: string };
+    return sourceNames.has(repo.name ?? "");
   });
 
   const { writeFile } = await import("node:fs/promises");
