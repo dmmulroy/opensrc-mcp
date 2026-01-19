@@ -7,17 +7,30 @@
   "bin": {
     "opensrc-mcp": "dist/index.mjs"
   },
-  "files": ["dist", "libs"],
+  "files": [
+    "dist",
+    "libs"
+  ],
   "scripts": {
-    "build": "tsdown src/index.ts src/vector/worker.ts --format esm --shims",
-    "dev": "tsdown src/index.ts src/vector/worker.ts --format esm --shims --watch",
+    "build": "tsdown src/index.ts --format esm --shims",
+    "dev": "tsdown src/index.ts --format esm --shims --watch",
     "start": "node dist/index.mjs",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["mcp", "model-context-protocol", "opensrc", "source-code", "ai", "llm", "vector-search", "semantic-search"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "opensrc",
+    "source-code",
+    "ai",
+    "llm",
+    "vector-search",
+    "semantic-search"
+  ],
   "license": "MIT",
   "dependencies": {
     "@xenova/transformers": "^2.17.0",
+    "better-result": "^2.3.1",
     "better-sqlite3": "^11.7.0",
     "tree-sitter": "^0.22.4",
     "tree-sitter-rust": "^0.23.2",

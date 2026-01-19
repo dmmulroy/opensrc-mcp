@@ -41,9 +41,17 @@ interface ParsedSpec {
   repoUrl?: string;
 }
 
-type FetchResult =
-  | { success: true; source: Source; alreadyExists: boolean }
-  | { success: false; error: string };
+interface FetchedSource {
+  source: Source;
+  alreadyExists: boolean;
+}
+
+interface FetchError {
+  _tag: "FetchError";
+  spec: string;
+  cause: unknown;
+  message: string;
+}
 
 interface RemoveResult {
   success: boolean;
@@ -65,6 +73,52 @@ type SearchResponse =
   | SearchResult[]
   | { error: "not_indexed"; sources: string[] };
 
+// Result type for explicit error handling
+interface Ok<T> {
+  status: "ok";
+  value: T;
+  isOk(): true;
+  isErr(): false;
+  match<R>(handlers: { ok: (v: T) => R; err: (e: unknown) => R }): R;
+  unwrap(): T;
+  unwrapOr<U>(fallback: U): T;
+}
+
+interface Err<E> {
+  status: "error";
+  error: E;
+  isOk(): false;
+  isErr(): true;
+  match<R>(handlers: { ok: (v: unknown) => R; err: (e: E) => R }): R;
+  unwrap(): never;
+  unwrapOr<U>(fallback: U): U;
+}
+
+type Result<T, E> = Ok<T> | Err<E>;
+
+// Error types returned by API operations
+interface SourceNotFoundError {
+  _tag: "SourceNotFoundError";
+  name: string;
+  message: string;
+}
+
+interface PathTraversalError {
+  _tag: "PathTraversalError";
+  path: string;
+  message: string;
+}
+
+interface FileReadError {
+  _tag: "FileReadError";
+  path: string;
+  cause: unknown;
+  message: string;
+}
+
+type SourceError = SourceNotFoundError | PathTraversalError | FileReadError;
+type FileSystemError = PathTraversalError | FileReadError;
+
 declare const sources: Source[];
 declare const cwd: string;
 
@@ -72,18 +126,18 @@ declare const opensrc: {
   // Read operations
   list(): Source[];
   has(name: string, version?: string): boolean;
-  get(name: string): Source | undefined;
-  files(sourceName: string, glob?: string): Promise<FileEntry[]>;
+  get(name: string): Result<Source, SourceNotFoundError>;
+  files(sourceName: string, glob?: string): Promise<Result<FileEntry[], SourceNotFoundError>>;
   grep(pattern: string, options?: {
     sources?: string[];
     include?: string;
     maxResults?: number;
   }): Promise<GrepResult[]>;
-  read(sourceName: string, filePath: string): Promise<string>;
+  read(sourceName: string, filePath: string): Promise<Result<string, SourceError>>;
   resolve(spec: string): Promise<ParsedSpec>;
 
   // Semantic search (vector-based)
-  search(query: string, options?: {
+  semanticSearch(query: string, options?: {
     sources?: string[];
     topK?: number;
   }): Promise<SearchResponse>;
@@ -91,16 +145,16 @@ declare const opensrc: {
   // Mutation operations
   fetch(specs: string | string[], options?: {
     modify?: boolean;
-  }): Promise<FetchResult[]>;
-  remove(names: string[]): Promise<RemoveResult>;
+  }): Promise<Result<FetchedSource[], FetchError>>;
+  remove(names: string[]): Promise<Result<RemoveResult, FileSystemError>>;
   clean(options?: {
     packages?: boolean;
     repos?: boolean;
     npm?: boolean;
     pypi?: boolean;
     crates?: boolean;
-  }): Promise<RemoveResult>;
-  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
+  }): Promise<Result<RemoveResult, FileSystemError>>;
+  readMany(sourceName: string, paths: string[]): Promise<Result<Record<string, string>, SourceNotFoundError>>;
 };
 `;
 
@@ -113,7 +167,7 @@ Fetch spec formats (input to opensrc.fetch):
 - vercel/ai         -> GitHub repo (default branch)
 - vercel/ai@v3.0.0  -> GitHub repo at tag/branch/commit
 
-Source names (returned in FetchResult.source.name, used for search/read):
+Source names (returned in FetchedSource.source.name, used for search/read):
 - npm packages:  "zod", "drizzle-orm", "@tanstack/react-query"
 - pypi packages: "requests", "numpy"  
 - crates:        "serde", "tokio"
@@ -132,48 +186,55 @@ async () => {
 
 // Fetch a package and get its source name for subsequent searches
 async () => {
-  const results = await opensrc.fetch("zod");
-  const result = results[0];
+  const result = await opensrc.fetch("zod");
   
-  if (!result.success) return { error: result.error };
-  
-  // Use source.name in future search calls
-  // For npm: name is "zod"
-  // For repos: name is "github.com/owner/repo"
-  return { 
-    sourceName: result.source.name,
-    type: result.source.type,
-    path: result.source.path 
-  };
+  // fetch returns Result - use match for explicit handling
+  return result.match({
+    ok: (fetched) => {
+      const { source } = fetched[0];
+      // Use source.name in future search calls
+      // For npm: name is "zod"
+      // For repos: name is "github.com/owner/repo"
+      return { 
+        sourceName: source.name,
+        type: source.type,
+        path: source.path 
+      };
+    },
+    err: (e) => ({ error: e.message })
+  });
 }
 
 // Fetch a GitHub repo and immediately explore its structure
 async () => {
-  const results = await opensrc.fetch("vercel/ai");
-  const result = results[0];
+  const fetchResult = await opensrc.fetch("vercel/ai");
   
-  if (!result.success) return { error: result.error };
+  if (fetchResult.isErr()) return { error: fetchResult.error.message };
   
   // Repo source names include the host: "github.com/vercel/ai"
-  const sourceName = result.source.name;
+  const sourceName = fetchResult.value[0].source.name;
   
-  // Now read key files
-  const files = await opensrc.readMany(sourceName, [
+  // Now read key files - returns Result, use .match() to handle
+  const filesResult = await opensrc.readMany(sourceName, [
     "package.json",
     "README.md",
     "src/index.ts"
   ]);
   
-  return { sourceName, files };
+  return filesResult.match({
+    ok: (files) => ({ sourceName, files }),
+    err: (e) => ({ error: e.message })
+  });
 }
 
 // Fetch multiple packages at once
 async () => {
-  const results = await opensrc.fetch(["zod", "drizzle-orm", "hono"]);
-  return results.map(r => r.success 
-    ? { name: r.source.name, success: true }
-    : { error: r.error, success: false }
-  );
+  const result = await opensrc.fetch(["zod", "drizzle-orm", "hono"]);
+  
+  return result.match({
+    ok: (fetched) => fetched.map(f => ({ name: f.source.name, success: true })),
+    err: (e) => ({ error: e.message, success: false })
+  });
 }
 
 // Find where a function is defined, then read the implementation
@@ -182,7 +243,12 @@ async () => {
   if (matches.length === 0) return "No matches found";
   
   const match = matches[0];
-  const content = await opensrc.read(match.source, match.file);
+  const contentResult = await opensrc.read(match.source, match.file);
+  
+  // Handle Result - unwrapOr provides fallback on error
+  const content = contentResult.unwrapOr("");
+  if (!content) return "Failed to read file";
+  
   const lines = content.split("\\n");
   
   // Return 30 lines starting from the match
@@ -200,12 +266,19 @@ async () => {
   // Source names for repos are like "github.com/owner/repo"
   const name = "github.com/vercel/ai";
   
-  // Find entry points
-  const files = await opensrc.files(name, "**/{index,main,mod}.{ts,js}");
+  // Find entry points - returns Result
+  const filesResult = await opensrc.files(name, "**/{index,main,mod}.{ts,js}");
+  
+  if (filesResult.isErr()) {
+    return { error: filesResult.error.message };
+  }
+  
+  const files = filesResult.value;
   
   // Read the first entry point found
   if (files.length > 0) {
-    return await opensrc.read(name, files[0].path);
+    const readResult = await opensrc.read(name, files[0].path);
+    return readResult.unwrapOr("Failed to read file");
   }
   return "No entry point found";
 }
@@ -218,33 +291,39 @@ async () => {
 
 // Batch read related files from a source
 async () => {
-  const files = await opensrc.readMany("zod", [
+  const result = await opensrc.readMany("zod", [
     "src/index.ts",
     "src/types.ts", 
     "src/ZodError.ts",
     "src/helpers/parseUtil.ts"
   ]);
   
-  // files is Record<string, string> - path -> content
-  return Object.keys(files).filter(path => !files[path].startsWith("[Error:"));
+  // Use match for explicit error handling
+  return result.match({
+    ok: (files) => Object.keys(files).filter(path => !files[path].startsWith("[Error:")),
+    err: (e) => ({ error: e.message })
+  });
 }
 
 // Clean up: remove specific sources or by type
 async () => {
-  // Remove specific packages
-  await opensrc.remove(["zod", "github.com/vercel/ai"]);
+  // Remove specific packages - returns Result
+  const removeResult = await opensrc.remove(["zod", "github.com/vercel/ai"]);
+  
+  return removeResult.match({
+    ok: (r) => ({ removed: r.removed }),
+    err: (e) => ({ error: e.message })
+  });
   
   // Or clean by type
-  // await opensrc.clean({ repos: true });  // remove all repos
-  // await opensrc.clean({ npm: true });    // remove all npm packages
-  
-  return "Cleaned";
+  // const cleanResult = await opensrc.clean({ repos: true });
+  // return cleanResult.match({ ok: (r) => r.removed, err: (e) => e.message });
 }
 
 // Semantic search: find code by meaning, not exact text
 async () => {
   // Search for code related to "parsing user input and validating schema"
-  const results = await opensrc.search("parse and validate user input", {
+  const results = await opensrc.semanticSearch("parse and validate user input", {
     sources: ["zod"],
     topK: 10
   });
@@ -266,15 +345,21 @@ async () => {
 
 // Search across all indexed sources
 async () => {
-  const results = await opensrc.search("error handling and retry logic");
+  const results = await opensrc.semanticSearch("error handling and retry logic");
   if ("error" in results) return results;
   
   // Read the top result's full content
   if (results.length > 0) {
     const top = results[0];
-    const content = await opensrc.read(top.source, top.file);
-    const lines = content.split("\\n");
-    return lines.slice(top.startLine - 1, top.endLine).join("\\n");
+    const contentResult = await opensrc.read(top.source, top.file);
+    
+    return contentResult.match({
+      ok: (content) => {
+        const lines = content.split("\\n");
+        return lines.slice(top.startLine - 1, top.endLine).join("\\n");
+      },
+      err: (e) => ({ error: e.message })
+    });
   }
   return "No results";
 }
@@ -282,9 +367,10 @@ async () => {
 
 /**
  * Create and configure the MCP server
+ * @param cwd - Current working directory (project the user is in)
  */
 export function createServer(
-  projectDir: string,
+  cwd: string,
   getSources: () => Source[],
   updateSources: (sources: Source[]) => void
 ): McpServer {
@@ -293,12 +379,12 @@ export function createServer(
     version: pkg.version,
   });
 
-  // Create unified API
-  const api = createOpensrcAPI(projectDir, getSources, updateSources);
+  // Create unified API (uses global opensrc dir)
+  const api = createOpensrcAPI(getSources, updateSources);
 
-  // Create executor
+  // Create executor (cwd exposed to sandbox for project context)
   const executor = createExecutor({
-    projectDir,
+    cwd,
     getSources,
     api,
   });
@@ -321,16 +407,15 @@ ${EXAMPLES}`,
     async ({ code }) => {
       const result = await executor(code);
 
-      if (result.error) {
-        return {
-          content: [{ type: "text", text: `Error: ${result.error}` }],
+      return result.match({
+        ok: (value) => ({
+          content: [{ type: "text", text: truncate(value) }],
+        }),
+        err: (error) => ({
+          content: [{ type: "text", text: `Error: ${error.message}` }],
           isError: true,
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: truncate(result.result) }],
-      };
+        }),
+      });
     }
   );
 

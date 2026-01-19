@@ -1,4 +1,6 @@
 import { pipeline } from "@xenova/transformers";
+import { Result } from "better-result";
+import { EmbedderNotInitializedError } from "../errors.js";
 
 const MODEL_NAME = "Xenova/bge-base-en-v1.5";
 const EMBEDDING_DIM = 768;
@@ -41,49 +43,67 @@ function toFloat32Array(output: unknown): Float32Array {
 /**
  * Embed a search query (with query prefix for better retrieval)
  */
-export async function embedQuery(query: string): Promise<Float32Array> {
+export async function embedQuery(
+  query: string
+): Promise<Result<Float32Array, EmbedderNotInitializedError>> {
   if (!embedder) {
-    throw new Error("Embedder not initialized. Call initEmbedder() first.");
+    return Result.err(new EmbedderNotInitializedError());
   }
 
   const text = QUERY_PREFIX + query;
   const output = await embedder(text, { pooling: "mean", normalize: true });
 
-  return toFloat32Array(output);
+  return Result.ok(toFloat32Array(output));
 }
 
 /**
- * Embed code chunks for storage
+ * Embed code chunks for storage (batched for performance)
  */
-export async function embedChunks(chunks: string[]): Promise<Float32Array[]> {
+export async function embedChunks(
+  chunks: string[]
+): Promise<Result<Float32Array[], EmbedderNotInitializedError>> {
   if (!embedder) {
-    throw new Error("Embedder not initialized. Call initEmbedder() first.");
+    return Result.err(new EmbedderNotInitializedError());
   }
 
+  if (chunks.length === 0) {
+    return Result.ok([]);
+  }
+
+  // Truncate all chunks first
+  const texts = chunks.map(truncateForEmbedding);
+
+  // Batch embed - transformers.js supports array input
+  const output = await embedder(texts, { pooling: "mean", normalize: true });
+
+  // Extract individual embeddings from batched output
+  // Output shape: [batch_size, embedding_dim] stored in flat .data array
   const results: Float32Array[] = [];
+  const data = (output as { data: ArrayLike<number> }).data;
 
-  for (const chunk of chunks) {
-    // Truncate if too long
-    const text = truncateForEmbedding(chunk);
-    const output = await embedder(text, { pooling: "mean", normalize: true });
-    results.push(toFloat32Array(output));
+  for (let i = 0; i < chunks.length; i++) {
+    const start = i * EMBEDDING_DIM;
+    const end = start + EMBEDDING_DIM;
+    results.push(new Float32Array(Array.prototype.slice.call(data, start, end)));
   }
 
-  return results;
+  return Result.ok(results);
 }
 
 /**
  * Embed a single chunk
  */
-export async function embedChunk(chunk: string): Promise<Float32Array> {
+export async function embedChunk(
+  chunk: string
+): Promise<Result<Float32Array, EmbedderNotInitializedError>> {
   if (!embedder) {
-    throw new Error("Embedder not initialized. Call initEmbedder() first.");
+    return Result.err(new EmbedderNotInitializedError());
   }
 
   const text = truncateForEmbedding(chunk);
   const output = await embedder(text, { pooling: "mean", normalize: true });
 
-  return toFloat32Array(output);
+  return Result.ok(toFloat32Array(output));
 }
 
 /**

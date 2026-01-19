@@ -2,8 +2,15 @@ import Database from "better-sqlite3";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { platform, arch } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { Result } from "better-result";
 import type { CodeChunk, SearchResult } from "./types.js";
+import {
+  UnsupportedPlatformError,
+  VectorExtensionError,
+  VectorExtensionNotAvailableError,
+  DatabaseError,
+} from "../errors.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -16,7 +23,7 @@ let vectorExtensionAvailable = false;
 /**
  * Get platform-specific sqlite-vector extension path
  */
-function getExtensionPath(): string {
+function getExtensionPath(): Result<string, UnsupportedPlatformError> {
   const p = platform();
   const a = arch();
 
@@ -36,7 +43,7 @@ function getExtensionPath(): string {
   const architecture = archMap[a];
 
   if (!plat || !architecture) {
-    throw new Error(`Unsupported platform: ${p}-${a}`);
+    return Result.err(new UnsupportedPlatformError(p, a));
   }
 
   const ext = p === "win32" ? "dll" : p === "darwin" ? "dylib" : "so";
@@ -50,34 +57,51 @@ function getExtensionPath(): string {
 
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
-      return candidate;
+      return Result.ok(candidate);
     }
   }
 
   // Fall back to expecting it in PATH or system lib
-  return `vector`;
+  return Result.ok("vector");
 }
 
 /**
  * Initialize SQLite database with vector extension
- * Throws if sqlite-vector extension cannot be loaded
  */
-export function initDB(opensrcDir: string): Database.Database {
+export function initDB(
+  opensrcDir: string
+): Result<Database.Database, UnsupportedPlatformError | VectorExtensionError> {
+  // Ensure directory exists
+  mkdirSync(opensrcDir, { recursive: true });
+
   const dbPath = join(opensrcDir, "vector.db");
   const db = new Database(dbPath);
 
-  // Load sqlite-vector extension (required)
-  const extPath = getExtensionPath();
-  try {
-    db.loadExtension(extPath);
-    vectorExtensionAvailable = true;
-  } catch (err) {
+  // Enable WAL mode for better concurrent access across projects
+  db.pragma("journal_mode = WAL");
+  db.pragma("busy_timeout = 5000");
+  db.pragma("synchronous = NORMAL");
+
+  // Get extension path
+  const extPathResult = getExtensionPath();
+  if (extPathResult.isErr()) {
     db.close();
-    throw new Error(
-      `sqlite-vector extension not found at ${extPath}. ` +
-      `Download from https://github.com/sqliteai/sqlite-vector/releases and place in libs/. ` +
-      `Original error: ${err}`
-    );
+    return extPathResult;
+  }
+  const extPath = extPathResult.value;
+
+  // Load extension
+  const loadResult = Result.try({
+    try: () => {
+      db.loadExtension(extPath);
+      vectorExtensionAvailable = true;
+    },
+    catch: (cause) => new VectorExtensionError(extPath, cause),
+  });
+
+  if (loadResult.isErr()) {
+    db.close();
+    return loadResult;
   }
 
   // Create tables
@@ -103,20 +127,16 @@ export function initDB(opensrcDir: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
   `);
 
-  // Initialize vector search
-  db.exec(`SELECT vector_init('chunks', 'embedding', 'type=FLOAT32,dimension=${EMBEDDING_DIM}')`);
+  // Initialize vector search with COSINE distance (best for normalized embeddings)
+  db.exec(`SELECT vector_init('chunks', 'embedding', 'type=FLOAT32,dimension=${EMBEDDING_DIM},distance=COSINE')`);
 
   // Preload existing quantized data if table has data
   const hasData = db.prepare("SELECT COUNT(*) as cnt FROM chunks").get() as { cnt: number };
   if (hasData.cnt > 0) {
-    try {
-      db.exec(`SELECT vector_quantize_preload('chunks', 'embedding')`);
-    } catch {
-      // Quantization not done yet or failed
-    }
+    Result.try(() => db.exec(`SELECT vector_quantize_preload('chunks', 'embedding')`));
   }
 
-  return db;
+  return Result.ok(db);
 }
 
 /**
@@ -146,51 +166,68 @@ function embeddingToJson(embedding: Float32Array): string {
 }
 
 /**
- * Insert chunks with embeddings
+ * Insert chunks with embeddings (does NOT quantize - call finalizeVectorIndex after all batches)
  */
 export function insertChunks(
   db: Database.Database,
   source: string,
   chunks: CodeChunk[],
   embeddings: Float32Array[]
-): void {
+): Result<void, VectorExtensionNotAvailableError | DatabaseError> {
   if (!vectorExtensionAvailable) {
-    throw new Error("sqlite-vector extension not available. See libs/README.md for installation.");
+    return Result.err(new VectorExtensionNotAvailableError());
   }
 
-  // Use vector_as_f32() wrapper for inserting embeddings
-  const insert = db.prepare(`
-    INSERT INTO chunks (source, file, identifier, kind, parent, start_line, end_line, content, embedding)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, vector_as_f32(?))
-  `);
+  return Result.try({
+    try: () => {
+      // Use vector_as_f32() wrapper for inserting embeddings
+      const insert = db.prepare(`
+        INSERT INTO chunks (source, file, identifier, kind, parent, start_line, end_line, content, embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, vector_as_f32(?))
+      `);
 
-  const tx = db.transaction(() => {
-    for (let i = 0; i < chunks.length; i++) {
-      const c = chunks[i];
-      const embeddingJson = embeddingToJson(embeddings[i]);
-      insert.run(
-        source,
-        c.file,
-        c.identifier,
-        c.kind,
-        c.parent ?? null,
-        c.startLine,
-        c.endLine,
-        c.content,
-        embeddingJson
-      );
-    }
+      const tx = db.transaction(() => {
+        for (let i = 0; i < chunks.length; i++) {
+          const c = chunks[i];
+          const embeddingJson = embeddingToJson(embeddings[i]);
+          insert.run(
+            source,
+            c.file,
+            c.identifier,
+            c.kind,
+            c.parent ?? null,
+            c.startLine,
+            c.endLine,
+            c.content,
+            embeddingJson
+          );
+        }
+      });
+
+      tx();
+    },
+    catch: (cause) => new DatabaseError("insertChunks", cause),
   });
+}
 
-  tx();
-
-  // Quantize and preload for vector search
-  try {
-    db.exec(`SELECT vector_quantize('chunks', 'embedding')`);
-    db.exec(`SELECT vector_quantize_preload('chunks', 'embedding')`);
-  } catch {
-    // Quantization optional
+/**
+ * Finalize vector index after all chunks are inserted.
+ * This is expensive - call ONCE after all batches, not per-batch.
+ */
+export function finalizeVectorIndex(
+  db: Database.Database
+): Result<void, VectorExtensionNotAvailableError | DatabaseError> {
+  if (!vectorExtensionAvailable) {
+    return Result.err(new VectorExtensionNotAvailableError());
   }
+
+  return Result.try({
+    try: () => {
+      db.exec(`SELECT vector_quantize('chunks', 'embedding')`);
+      db.exec(`SELECT vector_quantize_preload('chunks', 'embedding')`);
+    },
+    catch: (cause) => new DatabaseError("finalizeVectorIndex", cause),
+  });
 }
 
 /**
@@ -207,60 +244,67 @@ export function searchChunks(
   db: Database.Database,
   queryEmbedding: Float32Array,
   options: { sources?: string[]; topK: number }
-): SearchResult[] {
+): Result<SearchResult[], VectorExtensionNotAvailableError | DatabaseError> {
   if (!vectorExtensionAvailable) {
-    throw new Error("sqlite-vector extension not available. See libs/README.md for installation.");
+    return Result.err(new VectorExtensionNotAvailableError());
   }
 
-  const { sources, topK } = options;
-  const queryJson = embeddingToJson(queryEmbedding);
+  return Result.try({
+    try: () => {
+      const { sources, topK } = options;
+      const queryJson = embeddingToJson(queryEmbedding);
 
-  let sql: string;
-  const params: unknown[] = [];
+      let sql: string;
+      const params: unknown[] = [];
 
-  if (sources && sources.length > 0) {
-    // Filter by sources - use subquery approach
-    const placeholders = sources.map(() => "?").join(",");
-    sql = `
-      SELECT c.source, c.file, c.identifier, c.kind, c.start_line, c.end_line, c.content, v.distance
-      FROM chunks c
-      JOIN vector_quantize_scan('chunks', 'embedding', ?, ?) v ON c.id = v.rowid
-      WHERE c.source IN (${placeholders})
-      ORDER BY v.distance ASC
-      LIMIT ?
-    `;
-    params.push(queryJson, topK * 2, ...sources, topK);
-  } else {
-    sql = `
-      SELECT c.source, c.file, c.identifier, c.kind, c.start_line, c.end_line, c.content, v.distance
-      FROM chunks c
-      JOIN vector_quantize_scan('chunks', 'embedding', ?, ?) v ON c.id = v.rowid
-      ORDER BY v.distance ASC
-    `;
-    params.push(queryJson, topK);
-  }
+      // IMPORTANT: Must use vector_as_f32() for query vector per sqlite-vector API
+      // NOTE: sqlite-vector requires literal values for limit param, not placeholders
+      if (sources && sources.length > 0) {
+        // Filter by sources - use subquery approach
+        const placeholders = sources.map(() => "?").join(",");
+        sql = `
+          SELECT c.source, c.file, c.identifier, c.kind, c.start_line, c.end_line, c.content, v.distance
+          FROM chunks c
+          JOIN vector_quantize_scan('chunks', 'embedding', vector_as_f32(?), ${topK * 2}) v ON c.id = v.rowid
+          WHERE c.source IN (${placeholders})
+          ORDER BY v.distance ASC
+          LIMIT ${topK}
+        `;
+        params.push(queryJson, ...sources);
+      } else {
+        sql = `
+          SELECT c.source, c.file, c.identifier, c.kind, c.start_line, c.end_line, c.content, v.distance
+          FROM chunks c
+          JOIN vector_quantize_scan('chunks', 'embedding', vector_as_f32(?), ${topK}) v ON c.id = v.rowid
+          ORDER BY v.distance ASC
+        `;
+        params.push(queryJson);
+      }
 
-  const rows = db.prepare(sql).all(...params) as Array<{
-    source: string;
-    file: string;
-    identifier: string;
-    kind: string;
-    start_line: number;
-    end_line: number;
-    content: string;
-    distance: number;
-  }>;
+      const rows = db.prepare(sql).all(...params) as Array<{
+        source: string;
+        file: string;
+        identifier: string;
+        kind: string;
+        start_line: number;
+        end_line: number;
+        content: string;
+        distance: number;
+      }>;
 
-  return rows.map((r) => ({
-    source: r.source,
-    file: r.file,
-    identifier: r.identifier,
-    kind: r.kind as SearchResult["kind"],
-    startLine: r.start_line,
-    endLine: r.end_line,
-    content: r.content,
-    score: 1 - r.distance,
-  }));
+      return rows.map((r) => ({
+        source: r.source,
+        file: r.file,
+        identifier: r.identifier,
+        kind: r.kind as SearchResult["kind"],
+        startLine: r.start_line,
+        endLine: r.end_line,
+        content: r.content,
+        score: 1 - r.distance,
+      }));
+    },
+    catch: (cause) => new DatabaseError("searchChunks", cause),
+  });
 }
 
 /**

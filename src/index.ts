@@ -3,32 +3,43 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
 import { readSources, writeSources, getOpensrcDir } from "./sources.js";
-import { initVector, shutdownVector } from "./vector/index.js";
+import { initVector, shutdownVector, indexExistingSources } from "./vector/index.js";
 import type { Source } from "./types.js";
+import { createLogger, getLogPath } from "./logger.js";
+
+const log = createLogger("main");
 
 /**
  * Main entry point for opensrc-mcp server
  */
 async function main() {
-  // Determine project directory (current working directory)
-  const projectDir = process.cwd();
-  const opensrcDir = getOpensrcDir(projectDir);
+  // Use global opensrc directory (shared across all projects)
+  const opensrcDir = getOpensrcDir();
 
   // State: sources list
-  let sources: Source[] = await readSources(projectDir);
+  let sources: Source[] = await readSources();
 
   const getSources = () => sources;
   const updateSources = (newSources: Source[]) => {
     sources = newSources;
   };
 
-  // Initialize vector search worker (non-blocking, continues in background)
-  initVector(opensrcDir).catch((err) => {
-    console.error("Failed to initialize vector search:", err);
+  // Initialize vector search
+  log.info("starting", { opensrcDir, logFile: getLogPath() });
+  const vectorResult = await initVector(opensrcDir);
+  vectorResult.match({
+    ok: () => {
+      log.info("vector search initialized");
+      // Index any existing sources that haven't been indexed yet
+      indexExistingSources(sources.map((s) => ({ name: s.name, path: s.path })));
+    },
+    err: (e) => {
+      log.error("failed to initialize vector search", e);
+    },
   });
 
-  // Create MCP server
-  const server = createServer(projectDir, getSources, updateSources);
+  // Create MCP server (pass cwd for sandbox context)
+  const server = createServer(process.cwd(), getSources, updateSources);
 
   // Connect via stdio transport
   const transport = new StdioServerTransport();
@@ -36,7 +47,7 @@ async function main() {
 
   // Handle graceful shutdown
   const shutdown = async () => {
-    await writeSources(projectDir, sources);
+    await writeSources(sources);
     await shutdownVector();
     process.exit(0);
   };
@@ -46,6 +57,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
+  log.error("fatal error", err instanceof Error ? err : new Error(String(err)));
   process.exit(1);
 });

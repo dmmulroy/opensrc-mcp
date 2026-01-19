@@ -42,11 +42,12 @@ export interface ParsedSpec {
 }
 
 /**
- * Result of a fetch operation (discriminated union for type safety)
+ * Successful fetch data
  */
-export type FetchResult =
-  | { success: true; source: Source; alreadyExists: boolean }
-  | { success: false; error: string };
+export interface FetchedSource {
+  source: Source;
+  alreadyExists: boolean;
+}
 
 /**
  * Result of remove/clean operations
@@ -57,9 +58,7 @@ export interface RemoveResult {
 }
 
 /**
- * Executor result
+ * Executor result - uses Result for type-safe error handling
  */
-export interface ExecutorResult {
-  result?: unknown;
-  error?: string;
-}
+export type { Result } from "better-result";
+export type { ExecutorError } from "./errors.js";

@@ -1,6 +1,13 @@
 import { createContext, runInContext, Script, type Context } from "node:vm";
-import type { Source, ExecutorResult } from "./types.js";
+import { Result } from "better-result";
+import type { Source } from "./types.js";
 import type { OpensrcAPI } from "./api/opensrc.js";
+import { CodeExecutionError, ExecutionTimeoutError, type ExecutorError } from "./errors.js";
+
+/**
+ * Executor result type
+ */
+export type ExecutorResult = Result<unknown, ExecutorError>;
 
 /**
  * Deep freeze an object to prevent modification
@@ -32,7 +39,8 @@ const PROTOTYPE_FREEZE_CODE = `
 `;
 
 interface ExecutorOptions {
-  projectDir: string;
+  /** Current working directory (project the user is in) */
+  cwd: string;
   getSources: () => Source[];
   api: OpensrcAPI;
 }
@@ -41,14 +49,14 @@ interface ExecutorOptions {
  * Create a sandboxed code executor
  */
 export function createExecutor(options: ExecutorOptions) {
-  const { getSources, projectDir, api } = options;
+  const { getSources, cwd, api } = options;
 
   return async (code: string): Promise<ExecutorResult> => {
     // Build frozen context with injected API
     const frozenContext = deepFreeze({
       opensrc: api,
       sources: getSources(),
-      cwd: projectDir,
+      cwd,
     });
 
     // Create isolated context with minimal safe globals
@@ -70,6 +78,13 @@ export function createExecutor(options: ExecutorOptions) {
       }),
       Array: Object.freeze({ isArray: Array.isArray }),
       Promise: Promise,
+      // Expose Result for agent code to work with Result values
+      Result: Object.freeze({
+        ok: Result.ok,
+        err: Result.err,
+        isOk: Result.isOk,
+        isError: Result.isError,
+      }),
       // Block dangerous globals
       setTimeout: undefined,
       setInterval: undefined,
@@ -85,37 +100,43 @@ export function createExecutor(options: ExecutorOptions) {
     runInContext(PROTOTYPE_FREEZE_CODE, context);
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const TIMEOUT_MS = 30000;
 
-    try {
-      // Compile script
-      const script = new Script(`(${code})()`, {
-        filename: "agent-code.js",
-      });
+    const executeResult = await Result.tryPromise({
+      try: async () => {
+        // Compile script
+        const script = new Script(`(${code})()`, {
+          filename: "agent-code.js",
+        });
 
-      // Execute and await result
-      const resultPromise = script.runInContext(context, {
-        timeout: 30000,
-        breakOnSigint: true,
-      });
+        // Execute and await result
+        const resultPromise = script.runInContext(context, {
+          timeout: TIMEOUT_MS,
+          breakOnSigint: true,
+        });
 
-      // Handle async results with timeout (clear timer to prevent leak)
-      const result = await Promise.race([
-        resultPromise,
-        new Promise((_, reject) => {
+        // Handle async results with timeout
+        const timeoutPromise = new Promise<never>((_, reject) => {
           timeoutId = setTimeout(
-            () => reject(new Error("Execution timeout (30s)")),
-            30000
+            () => reject(new ExecutionTimeoutError(TIMEOUT_MS)),
+            TIMEOUT_MS
           );
-        }),
-      ]);
+        });
 
-      return { result };
-    } catch (err) {
-      return { error: err instanceof Error ? err.message : String(err) };
-    } finally {
-      if (timeoutId !== undefined) {
-        clearTimeout(timeoutId);
-      }
+        return await Promise.race([resultPromise, timeoutPromise]);
+      },
+      catch: (cause) => {
+        if (cause instanceof ExecutionTimeoutError) {
+          return cause;
+        }
+        return new CodeExecutionError(cause);
+      },
+    });
+
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
     }
+
+    return executeResult;
   };
 }

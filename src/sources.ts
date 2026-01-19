@@ -2,19 +2,20 @@ import { join } from "node:path";
 import { readFile, rm, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import type { Source } from "./types.js";
+import { getGlobalOpensrcDir } from "./config.js";
 
 /**
- * Get path to opensrc directory
+ * Get path to global opensrc directory
  */
-export function getOpensrcDir(projectDir: string): string {
-  return join(projectDir, "opensrc");
+export function getOpensrcDir(): string {
+  return getGlobalOpensrcDir();
 }
 
 /**
  * Ensure opensrc directories exist
  */
-export async function ensureOpensrcDirs(projectDir: string): Promise<void> {
-  const opensrcDir = getOpensrcDir(projectDir);
+export async function ensureOpensrcDirs(): Promise<void> {
+  const opensrcDir = getOpensrcDir();
   if (!existsSync(opensrcDir)) {
     await mkdir(opensrcDir, { recursive: true });
   }
@@ -24,8 +25,8 @@ export async function ensureOpensrcDirs(projectDir: string): Promise<void> {
  * Read sources from opensrc's sources.json format
  * opensrc uses: { packages: [...], repos: [...] }
  */
-export async function readSources(projectDir: string): Promise<Source[]> {
-  const sourcesPath = join(getOpensrcDir(projectDir), "sources.json");
+export async function readSources(): Promise<Source[]> {
+  const sourcesPath = join(getOpensrcDir(), "sources.json");
 
   if (!existsSync(sourcesPath)) {
     return [];
@@ -73,13 +74,10 @@ export async function readSources(projectDir: string): Promise<Source[]> {
  * Write sources - delegates to opensrc's format
  * Note: opensrc manages its own sources.json, this is for compatibility
  */
-export async function writeSources(
-  projectDir: string,
-  sources: Source[]
-): Promise<void> {
+export async function writeSources(sources: Source[]): Promise<void> {
   // opensrc manages its own sources.json
   // We only need to write if doing manual cleanup
-  const sourcesPath = join(getOpensrcDir(projectDir), "sources.json");
+  const sourcesPath = join(getOpensrcDir(), "sources.json");
 
   // Read existing to preserve format
   let existing = { packages: [] as unknown[], repos: [] as unknown[] };
@@ -117,7 +115,6 @@ export async function writeSources(
  * Remove sources by name
  */
 export async function removeSourcesByName(
-  projectDir: string,
   names: string[],
   currentSources: Source[]
 ): Promise<string[]> {
@@ -126,7 +123,7 @@ export async function removeSourcesByName(
   for (const name of names) {
     const source = currentSources.find((s) => s.name === name);
     if (source) {
-      const sourcePath = join(getOpensrcDir(projectDir), source.path);
+      const sourcePath = join(getOpensrcDir(), source.path);
       if (existsSync(sourcePath)) {
         await rm(sourcePath, { recursive: true, force: true });
       }
@@ -141,7 +138,6 @@ export async function removeSourcesByName(
  * Clean sources based on filters
  */
 export async function cleanSourcesFiltered(
-  projectDir: string,
   currentSources: Source[],
   options: {
     packages?: boolean;
@@ -165,9 +161,5 @@ export async function cleanSourcesFiltered(
     return false;
   });
 
-  return removeSourcesByName(
-    projectDir,
-    toRemove.map((s) => s.name),
-    currentSources
-  );
+  return removeSourcesByName(toRemove.map((s) => s.name), currentSources);
 }

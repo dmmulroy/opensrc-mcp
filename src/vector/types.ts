@@ -43,23 +43,12 @@ export interface SearchResult {
 }
 
 /**
- * Search response - either results or not_indexed error
+ * Search response - results or error with reason
  */
 export type SearchResponse =
   | SearchResult[]
-  | { error: "not_indexed"; sources: string[] };
-
-/**
- * Message types for worker communication
- */
-export type WorkerMessage =
-  | { type: "init"; opensrcDir: string }
-  | { type: "index"; source: string; path: string }
-  | { type: "search"; id: string; query: string; options?: SearchOptions }
-  | { type: "ready" }
-  | { type: "indexed"; source: string; skipped: boolean }
-  | { type: "results"; id: string; results?: SearchResult[]; error?: "not_indexed"; sources?: string[] }
-  | { type: "error"; error: string };
+  | { error: "not_indexed"; sources: string[] }
+  | { error: "indexing"; sources: string[] };
 
 export interface SearchOptions {
   sources?: string[];
