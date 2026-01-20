@@ -3,7 +3,6 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
 import { readSources, writeSources, getOpensrcDir } from "./sources.js";
-import { initVector, shutdownVector, indexExistingSources } from "./vector/index.js";
 import type { Source } from "./types.js";
 import { createLogger, getLogPath } from "./logger.js";
 
@@ -24,19 +23,7 @@ async function main() {
     sources = newSources;
   };
 
-  // Initialize vector search
   log.info("starting", { opensrcDir, logFile: getLogPath() });
-  const vectorResult = await initVector(opensrcDir);
-  vectorResult.match({
-    ok: () => {
-      log.info("vector search initialized");
-      // Index any existing sources that haven't been indexed yet
-      indexExistingSources(sources.map((s) => ({ name: s.name, path: s.path })));
-    },
-    err: (e) => {
-      log.error("failed to initialize vector search", e);
-    },
-  });
 
   // Create MCP server (pass cwd for sandbox context)
   const server = createServer(process.cwd(), getSources, updateSources);
@@ -48,7 +35,6 @@ async function main() {
   // Handle graceful shutdown
   const shutdown = async () => {
     await writeSources(sources);
-    await shutdownVector();
     process.exit(0);
   };
 

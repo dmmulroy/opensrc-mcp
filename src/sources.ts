@@ -1,8 +1,14 @@
 import { join } from "node:path";
-import { readFile, rm, mkdir } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import type { Source } from "./types.js";
-import { getGlobalOpensrcDir } from "./config.js";
+import { getGlobalOpensrcDir, getOpensrcCwd } from "./config.js";
+import {
+  listSources as opensrcListSources,
+  removePackageSource,
+  removeRepoSource,
+} from "opensrc/dist/lib/git.js";
+import type { Registry } from "opensrc/dist/types.js";
 
 /**
  * Get path to global opensrc directory
@@ -22,67 +28,55 @@ export async function ensureOpensrcDirs(): Promise<void> {
 }
 
 /**
- * Read sources from opensrc's sources.json format
- * opensrc uses: { packages: [...], repos: [...] }
+ * Read sources using opensrc's listSources and normalize to our Source type
  */
 export async function readSources(): Promise<Source[]> {
-  const sourcesPath = join(getOpensrcDir(), "sources.json");
+  const { packages, repos } = await opensrcListSources(getOpensrcCwd());
+  const sources: Source[] = [];
 
-  if (!existsSync(sourcesPath)) {
-    return [];
+  // Convert opensrc package format to our Source format
+  for (const pkg of packages) {
+    sources.push({
+      type: pkg.registry,
+      name: pkg.name,
+      version: pkg.version,
+      path: pkg.path.replace(/^opensrc\//, ""),
+      fetchedAt: pkg.fetchedAt,
+      repository: "",
+    });
   }
 
-  try {
-    const content = await readFile(sourcesPath, "utf8");
-    const data = JSON.parse(content);
-    const sources: Source[] = [];
-
-    // Convert opensrc package format to our Source format
-    for (const pkg of data.packages ?? []) {
-      sources.push({
-        type: pkg.registry ?? "npm",
-        name: pkg.name,
-        version: pkg.version,
-        path: pkg.path.replace(/^opensrc\//, ""),
-        fetchedAt: pkg.fetchedAt ?? new Date().toISOString(),
-        repository: pkg.repository ?? "",
-      });
-    }
-
-    // Convert opensrc repo format to our Source format
-    // RepoEntry has: name (e.g. "github.com/owner/repo"), version (ref), path, fetchedAt
-    for (const repo of data.repos ?? []) {
-      sources.push({
-        type: "repo",
-        name: repo.name,
-        ref: repo.version,
-        path: repo.path.replace(/^opensrc\//, ""),
-        fetchedAt: repo.fetchedAt ?? new Date().toISOString(),
-        repository: repo.name.startsWith("github.com")
-          ? `https://${repo.name}`
-          : `https://github.com/${repo.name}`,
-      });
-    }
-
-    return sources;
-  } catch {
-    return [];
+  // Convert opensrc repo format to our Source format
+  for (const repo of repos) {
+    sources.push({
+      type: "repo",
+      name: repo.name,
+      ref: repo.version,
+      path: repo.path.replace(/^opensrc\//, ""),
+      fetchedAt: repo.fetchedAt,
+      repository: repo.name.startsWith("github.com")
+        ? `https://${repo.name}`
+        : `https://github.com/${repo.name}`,
+    });
   }
+
+  return sources;
 }
 
 /**
- * Write sources - delegates to opensrc's format
- * Note: opensrc manages its own sources.json, this is for compatibility
+ * Write sources - delegates to opensrc format
+ * Note: opensrc manages its own sources.json during fetch/remove operations
  */
 export async function writeSources(sources: Source[]): Promise<void> {
-  // opensrc manages its own sources.json
-  // We only need to write if doing manual cleanup
+  // opensrc manages its own sources.json through its commands
+  // We only need to write if doing manual cleanup outside of opensrc
   const sourcesPath = join(getOpensrcDir(), "sources.json");
 
   // Read existing to preserve format
   let existing = { packages: [] as unknown[], repos: [] as unknown[] };
   if (existsSync(sourcesPath)) {
     try {
+      const { readFile } = await import("node:fs/promises");
       existing = JSON.parse(await readFile(sourcesPath, "utf8"));
     } catch {
       // use default
@@ -112,22 +106,32 @@ export async function writeSources(sources: Source[]): Promise<void> {
 }
 
 /**
- * Remove sources by name
+ * Remove sources by name using opensrc's smart removal
+ * (monorepo-aware: only removes repo if no other packages use it)
  */
 export async function removeSourcesByName(
   names: string[],
   currentSources: Source[]
 ): Promise<string[]> {
   const removed: string[] = [];
+  const cwd = getOpensrcCwd();
 
   for (const name of names) {
     const source = currentSources.find((s) => s.name === name);
-    if (source) {
-      const sourcePath = join(getOpensrcDir(), source.path);
-      if (existsSync(sourcePath)) {
-        await rm(sourcePath, { recursive: true, force: true });
+    if (!source) continue;
+
+    if (source.type === "repo") {
+      // Use opensrc's removeRepoSource
+      const success = await removeRepoSource(name, cwd);
+      if (success) {
+        removed.push(name);
       }
-      removed.push(name);
+    } else {
+      // Use opensrc's removePackageSource (monorepo-aware)
+      const result = await removePackageSource(name, cwd, source.type as Registry);
+      if (result.removed) {
+        removed.push(name);
+      }
     }
   }
 

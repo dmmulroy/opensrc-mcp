@@ -48,70 +48,6 @@ export class SourceNotFoundError extends TaggedError("SourceNotFoundError")<{
   }
 }
 
-// ── Database Errors ──────────────────────────────────────────────────────────
-
-export class DatabaseError extends TaggedError("DatabaseError")<{
-  operation: string;
-  cause: unknown;
-  message: string;
-}>() {
-  constructor(operation: string, cause: unknown) {
-    super({
-      operation,
-      cause,
-      message: `Database ${operation} failed`,
-    });
-  }
-}
-
-export class VectorExtensionError extends TaggedError("VectorExtensionError")<{
-  extensionPath: string;
-  cause: unknown;
-  message: string;
-}>() {
-  constructor(extensionPath: string, cause: unknown) {
-    super({
-      extensionPath,
-      cause,
-      message: `sqlite-vector extension not found at ${extensionPath}`,
-    });
-  }
-}
-
-export class VectorExtensionNotAvailableError extends TaggedError("VectorExtensionNotAvailableError")<{
-  message: string;
-}>() {
-  constructor() {
-    super({ message: "sqlite-vector extension not available. See libs/README.md for installation." });
-  }
-}
-
-// ── Platform Errors ──────────────────────────────────────────────────────────
-
-export class UnsupportedPlatformError extends TaggedError("UnsupportedPlatformError")<{
-  platform: string;
-  arch: string;
-  message: string;
-}>() {
-  constructor(platform: string, arch: string) {
-    super({
-      platform,
-      arch,
-      message: `Unsupported platform: ${platform}-${arch}`,
-    });
-  }
-}
-
-// ── Embedding Errors ─────────────────────────────────────────────────────────
-
-export class EmbedderNotInitializedError extends TaggedError("EmbedderNotInitializedError")<{
-  message: string;
-}>() {
-  constructor() {
-    super({ message: "Embedder not initialized. Call initEmbedder() first." });
-  }
-}
-
 // ── Executor Errors ──────────────────────────────────────────────────────────
 
 export class ExecutionTimeoutError extends TaggedError("ExecutionTimeoutError")<{
@@ -152,29 +88,8 @@ export class FetchError extends TaggedError("FetchError")<{
   }
 }
 
-// ── Worker Errors ────────────────────────────────────────────────────────────
-
-export class WorkerInitError extends TaggedError("WorkerInitError")<{
-  cause: unknown;
-  message: string;
-}>() {
-  constructor(cause: unknown) {
-    const msg = cause instanceof Error ? cause.message : String(cause);
-    super({ cause, message: `Worker initialization failed: ${msg}` });
-  }
-}
-
-export class DatabaseNotInitializedError extends TaggedError("DatabaseNotInitializedError")<{
-  message: string;
-}>() {
-  constructor() {
-    super({ message: "Database not initialized" });
-  }
-}
-
 // ── Type Aliases for Error Unions ────────────────────────────────────────────
 
 export type FileSystemError = PathTraversalError | FileNotFoundError | FileReadError;
-export type VectorError = VectorExtensionError | VectorExtensionNotAvailableError | DatabaseError | EmbedderNotInitializedError;
 export type SourceError = SourceNotFoundError | FileSystemError;
 export type ExecutorError = CodeExecutionError | ExecutionTimeoutError;

@@ -58,6 +58,28 @@ export interface RemoveResult {
 }
 
 /**
+ * AST-grep search match
+ */
+export interface AstGrepMatch {
+  file: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  text: string;
+  metavars: Record<string, string>;
+}
+
+/**
+ * AST-grep search options
+ */
+export interface AstGrepOptions {
+  glob?: string;
+  lang?: string | string[];
+  limit?: number;
+}
+
+/**
  * Executor result - uses Result for type-safe error handling
  */
 export type { Result } from "better-result";

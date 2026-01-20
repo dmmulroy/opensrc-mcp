@@ -1,16 +1,8 @@
-import { join, resolve } from "node:path";
+import { join, resolve, extname } from "node:path";
 import { readFile } from "node:fs/promises";
 import fg, { type Entry } from "fast-glob";
-import { Result } from "better-result";
-import type { Source, FileEntry, GrepResult, ParsedSpec, FetchedSource, RemoveResult } from "../types.js";
-import {
-  SourceNotFoundError,
-  PathTraversalError,
-  FileReadError,
-  FetchError,
-  type SourceError,
-  type FileSystemError,
-} from "../errors.js";
+import { Lang, parse, type SgNode } from "@ast-grep/napi";
+import type { Source, FileEntry, GrepResult, ParsedSpec, FetchedSource, RemoveResult, AstGrepMatch, AstGrepOptions } from "../types.js";
 import {
   getOpensrcDir,
   removeSourcesByName,
@@ -21,10 +13,60 @@ import {
 import { getOpensrcCwd } from "../config.js";
 import { fetchCommand } from "opensrc/dist/commands/fetch.js";
 import { parsePackageSpec, detectInputType } from "opensrc/dist/lib/registries/index.js";
-import { queueIndex, search as vectorSearch, type SearchResponse } from "../vector/index.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("api");
+
+// Extension → Lang mapping for ast-grep
+const EXT_LANG: Record<string, Lang> = {
+  ".js": Lang.JavaScript,
+  ".mjs": Lang.JavaScript,
+  ".cjs": Lang.JavaScript,
+  ".jsx": Lang.JavaScript,
+  ".ts": Lang.TypeScript,
+  ".tsx": Lang.Tsx,
+  ".html": Lang.Html,
+  ".css": Lang.Css,
+};
+
+// String → Lang mapping (for options.lang)
+const STR_LANG: Record<string, Lang> = {
+  javascript: Lang.JavaScript,
+  js: Lang.JavaScript,
+  typescript: Lang.TypeScript,
+  ts: Lang.TypeScript,
+  tsx: Lang.Tsx,
+  jsx: Lang.JavaScript,
+  html: Lang.Html,
+  css: Lang.Css,
+};
+
+// Extract metavar names from pattern (e.g. "$NAME", "$$$ARGS")
+function parseMetavars(pattern: string): string[] {
+  const matches = pattern.match(/\$+[A-Z_][A-Z0-9_]*/g) ?? [];
+  return [...new Set(matches.map((m) => m.replace(/^\$+/, "")))];
+}
+
+// Extract captured metavars from matched node
+function extractMetavars(
+  node: SgNode,
+  varNames: string[]
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const name of varNames) {
+    const match = node.getMatch(name);
+    if (match) {
+      result[name] = match.text();
+      continue;
+    }
+    // For $$$ multi-matches
+    const multi = node.getMultipleMatches(name);
+    if (multi.length > 0) {
+      result[name] = multi.map((n) => n.text()).join(", ");
+    }
+  }
+  return result;
+}
 
 interface OpensrcFetchResult {
   package: string;
@@ -39,37 +81,37 @@ export interface OpensrcAPI {
   // Read operations
   list(): Source[];
   has(name: string, version?: string): boolean;
-  get(name: string): Result<Source, SourceNotFoundError>;
-  files(sourceName: string, glob?: string): Promise<Result<FileEntry[], SourceNotFoundError>>;
+  get(name: string): Source | undefined;
+  files(sourceName: string, glob?: string): Promise<FileEntry[]>;
   grep(pattern: string, options?: {
     sources?: string[];
     include?: string;
     maxResults?: number;
   }): Promise<GrepResult[]>;
-  read(sourceName: string, filePath: string): Promise<Result<string, SourceError>>;
+  astGrep(
+    sourceName: string,
+    pattern: string,
+    options?: AstGrepOptions
+  ): Promise<AstGrepMatch[]>;
+  read(sourceName: string, filePath: string): Promise<string>;
   resolve(spec: string): Promise<ParsedSpec>;
 
-  // Vector search
-  semanticSearch(query: string, options?: {
-    sources?: string[];
-    topK?: number;
-  }): Promise<SearchResponse>;
-
   // Mutation operations
-  fetch(specs: string | string[], options?: { modify?: boolean; }): Promise<Result<FetchedSource[], FetchError>>;
-  remove(names: string[]): Promise<Result<RemoveResult, FileSystemError>>;
+  fetch(specs: string | string[], options?: { modify?: boolean; }): Promise<FetchedSource[]>;
+  remove(names: string[]): Promise<RemoveResult>;
   clean(options?: {
     packages?: boolean;
     repos?: boolean;
     npm?: boolean;
     pypi?: boolean;
     crates?: boolean;
-  }): Promise<Result<RemoveResult, FileSystemError>>;
-  readMany(sourceName: string, paths: string[]): Promise<Result<Record<string, string>, SourceNotFoundError>>;
+  }): Promise<RemoveResult>;
+  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
 }
 
 /**
  * Create unified opensrc API for the executor sandbox
+ * Simple API: returns values directly, throws on errors
  */
 export function createOpensrcAPI(
   getSources: () => Source[],
@@ -91,21 +133,14 @@ export function createOpensrcAPI(
       );
     },
 
-    get: (name: string): Result<Source, SourceNotFoundError> => {
-      const source = getSources().find((s) => s.name === name);
-      if (!source) {
-        return Result.err(new SourceNotFoundError(name));
-      }
-      return Result.ok(source);
+    get: (name: string): Source | undefined => {
+      return getSources().find((s) => s.name === name);
     },
 
-    files: async (
-      sourceName: string,
-      glob = "**/*"
-    ): Promise<Result<FileEntry[], SourceNotFoundError>> => {
+    files: async (sourceName: string, glob = "**/*"): Promise<FileEntry[]> => {
       const source = getSources().find((s) => s.name === sourceName);
       if (!source) {
-        return Result.err(new SourceNotFoundError(sourceName));
+        throw new Error(`Source not found: ${sourceName}`);
       }
 
       const sourcePath = join(opensrcDir, source.path);
@@ -117,24 +152,18 @@ export function createOpensrcAPI(
         onlyFiles: false,
       });
 
-      return Result.ok(
-        entries.map((e: Entry) => ({
-          path: e.path,
-          size: e.stats?.size ?? 0,
-          isDirectory: e.stats?.isDirectory() ?? false,
-        }))
-      );
+      return entries.map((e: Entry) => ({
+        path: e.path,
+        size: e.stats?.size ?? 0,
+        isDirectory: e.stats?.isDirectory() ?? false,
+      }));
     },
 
-    read: async (
-      sourceName: string,
-      filePath: string
-    ): Promise<Result<string, SourceError>> => {
+    read: async (sourceName: string, filePath: string): Promise<string> => {
       log.debug("read", { source: sourceName, file: filePath });
       const source = getSources().find((s) => s.name === sourceName);
       if (!source) {
-        log.warn("read failed: source not found", { source: sourceName });
-        return Result.err(new SourceNotFoundError(sourceName));
+        throw new Error(`Source not found: ${sourceName}`);
       }
 
       const sourcePath = resolve(opensrcDir, source.path);
@@ -142,14 +171,10 @@ export function createOpensrcAPI(
 
       // Verify resolved path is within source directory (path traversal protection)
       if (!fullPath.startsWith(sourcePath + "/") && fullPath !== sourcePath) {
-        log.warn("read failed: path traversal", { path: fullPath });
-        return Result.err(new PathTraversalError(fullPath));
+        throw new Error(`Path traversal not allowed: ${filePath}`);
       }
 
-      return Result.tryPromise({
-        try: () => readFile(fullPath, "utf8"),
-        catch: (cause) => new FileReadError(fullPath, cause),
-      });
+      return readFile(fullPath, "utf8");
     },
 
     grep: async (
@@ -167,7 +192,6 @@ export function createOpensrcAPI(
       );
 
       const results: GrepResult[] = [];
-      // Use 'i' flag only - no 'g' flag since we test line-by-line
       const regex = new RegExp(pattern, "i");
 
       for (const source of sources) {
@@ -207,6 +231,90 @@ export function createOpensrcAPI(
       return results;
     },
 
+    astGrep: async (
+      sourceName: string,
+      pattern: string,
+      options: AstGrepOptions = {}
+    ): Promise<AstGrepMatch[]> => {
+      const { glob: globPattern, lang, limit = 1000 } = options;
+      log.debug("astGrep", { source: sourceName, pattern, lang, limit });
+
+      // Validate source
+      const source = getSources().find((s) => s.name === sourceName);
+      if (!source) {
+        throw new Error(`Source not found: ${sourceName}`);
+      }
+
+      // Normalize lang to array of Lang values
+      const langs: Lang[] | null = lang
+        ? (Array.isArray(lang) ? lang : [lang])
+            .map((l) => STR_LANG[l.toLowerCase()])
+            .filter((l): l is Lang => l !== undefined)
+        : null;
+
+      const sourcePath = resolve(opensrcDir, source.path);
+      const matches: AstGrepMatch[] = [];
+      const metavarNames = parseMetavars(pattern);
+
+      // Get files using existing files() method logic
+      const fileEntries = await fg(globPattern ?? "**/*", {
+        cwd: sourcePath,
+        dot: false,
+        ignore: ["**/node_modules/**", "**/.git/**"],
+        stats: true,
+        onlyFiles: true,
+      });
+
+      for (const entry of fileEntries) {
+        if (matches.length >= limit) break;
+
+        const filePath = typeof entry === "string" ? entry : entry.path;
+        const ext = extname(filePath);
+        const extLang = EXT_LANG[ext];
+
+        // Skip if lang specified but file extension doesn't match any
+        if (langs && langs.length > 0 && !langs.includes(extLang)) continue;
+
+        // Determine language from extension
+        const fileLang = extLang;
+        if (!fileLang) continue;
+
+        // Parse and search
+        try {
+          const fullPath = resolve(sourcePath, filePath);
+
+          // Path traversal check
+          if (!fullPath.startsWith(sourcePath + "/") && fullPath !== sourcePath) {
+            continue;
+          }
+
+          const content = await readFile(fullPath, "utf-8");
+          const root = parse(fileLang, content).root();
+          const nodes = root.findAll(pattern);
+
+          for (const node of nodes) {
+            if (matches.length >= limit) break;
+            const range = node.range();
+            matches.push({
+              file: filePath,
+              line: range.start.line + 1,
+              column: range.start.column + 1,
+              endLine: range.end.line + 1,
+              endColumn: range.end.column + 1,
+              text: node.text(),
+              metavars: extractMetavars(node, metavarNames),
+            });
+          }
+        } catch {
+          // Skip unparseable files
+          continue;
+        }
+      }
+
+      log.debug("astGrep complete", { matches: matches.length });
+      return matches;
+    },
+
     resolve: async (spec: string): Promise<ParsedSpec> => {
       const inputType = detectInputType(spec);
 
@@ -231,91 +339,60 @@ export function createOpensrcAPI(
       };
     },
 
-    // ── Semantic Search ─────────────────────────────────────────────────
-
-    semanticSearch: async (
-      query: string,
-      options?: { sources?: string[]; topK?: number; }
-    ): Promise<SearchResponse> => {
-      log.info("semanticSearch called", { query: query.slice(0, 50) });
-      // vectorSearch already returns error states in SearchResponse, no need for try/catch
-      const result = await vectorSearch(query, options);
-      log.info("semanticSearch done", { resultCount: Array.isArray(result) ? result.length : "error" });
-      return result;
-    },
-
     // ── Mutation Operations ──────────────────────────────────────────────
 
     fetch: async (
       specs: string | string[],
       options: { modify?: boolean; } = {}
-    ): Promise<Result<FetchedSource[], FetchError>> => {
+    ): Promise<FetchedSource[]> => {
       const specList = Array.isArray(specs) ? specs : [specs];
       log.info("fetch", { specs: specList, modify: options.modify });
 
-      return Result.tryPromise({
-        try: async () => {
-          const opensrcResults: OpensrcFetchResult[] = await fetchCommand(
-            specList,
-            {
-              cwd: getOpensrcCwd(),
-              allowModifications: options.modify ?? false,
-            }
-          );
-          log.debug("fetch results", { results: opensrcResults.map(r => ({ pkg: r.package, success: r.success })) });
+      const opensrcResults: OpensrcFetchResult[] = await fetchCommand(
+        specList,
+        {
+          cwd: getOpensrcCwd(),
+          allowModifications: options.modify ?? false,
+        }
+      );
+      log.debug("fetch results", { results: opensrcResults.map(r => ({ pkg: r.package, success: r.success })) });
 
-          const newSources = await readSources();
-          updateSources(newSources);
+      const newSources = await readSources();
+      updateSources(newSources);
 
-          const results: FetchedSource[] = [];
+      const results: FetchedSource[] = [];
 
-          for (const r of opensrcResults) {
-            if (!r.success) {
-              throw new FetchError(r.package, new Error(r.error ?? "Unknown fetch error"));
-            }
+      for (const r of opensrcResults) {
+        if (!r.success) {
+          throw new Error(`Failed to fetch ${r.package}: ${r.error ?? "Unknown error"}`);
+        }
 
-            const source = newSources.find(
-              (s) => s.name === r.package || s.path.includes(r.package)
-            );
+        const source = newSources.find(
+          (s) => s.name === r.package || s.path.includes(r.package)
+        );
 
-            if (!source) {
-              throw new FetchError(r.package, new Error(`Source not found after fetch: ${r.package}`));
-            }
+        if (!source) {
+          throw new Error(`Source not found after fetch: ${r.package}`);
+        }
 
-            results.push({
-              source,
-              alreadyExists: false,
-            });
-          }
+        results.push({
+          source,
+          alreadyExists: false,
+        });
+      }
 
-          // Queue successful fetches for vector indexing (non-blocking)
-          for (const res of results) {
-            queueIndex(res.source.name, res.source.path);
-          }
-
-          return results;
-        },
-        catch: (cause) => {
-          if (cause instanceof FetchError) return cause;
-          return new FetchError(specList.join(", "), cause);
-        },
-      });
+      return results;
     },
 
-    remove: async (names: string[]): Promise<Result<RemoveResult, FileSystemError>> => {
+    remove: async (names: string[]): Promise<RemoveResult> => {
       log.info("remove", { names });
-      return Result.tryPromise({
-        try: async () => {
-          const sources = getSources();
-          const removed = await removeSourcesByName(names, sources);
-          log.debug("remove complete", { removed });
-          const newSources = sources.filter((s) => !names.includes(s.name));
-          updateSources(newSources);
-          await writeSources(newSources);
-          return { success: true, removed };
-        },
-        catch: (cause) => new FileReadError("remove operation", cause),
-      });
+      const sources = getSources();
+      const removed = await removeSourcesByName(names, sources);
+      log.debug("remove complete", { removed });
+      const newSources = sources.filter((s) => !names.includes(s.name));
+      updateSources(newSources);
+      await writeSources(newSources);
+      return { success: true, removed };
     },
 
     clean: async (
@@ -326,27 +403,22 @@ export function createOpensrcAPI(
         pypi?: boolean;
         crates?: boolean;
       } = {}
-    ): Promise<Result<RemoveResult, FileSystemError>> => {
-      return Result.tryPromise({
-        try: async () => {
-          const sources = getSources();
-          const removed = await cleanSourcesFiltered(sources, options);
-          const newSources = sources.filter((s) => !removed.includes(s.name));
-          updateSources(newSources);
-          await writeSources(newSources);
-          return { success: true, removed };
-        },
-        catch: (cause) => new FileReadError("clean operation", cause),
-      });
+    ): Promise<RemoveResult> => {
+      const sources = getSources();
+      const removed = await cleanSourcesFiltered(sources, options);
+      const newSources = sources.filter((s) => !removed.includes(s.name));
+      updateSources(newSources);
+      await writeSources(newSources);
+      return { success: true, removed };
     },
 
     readMany: async (
       sourceName: string,
       paths: string[]
-    ): Promise<Result<Record<string, string>, SourceNotFoundError>> => {
+    ): Promise<Record<string, string>> => {
       const source = getSources().find((s) => s.name === sourceName);
       if (!source) {
-        return Result.err(new SourceNotFoundError(sourceName));
+        throw new Error(`Source not found: ${sourceName}`);
       }
 
       const sourcePath = resolve(opensrcDir, source.path);
@@ -360,16 +432,17 @@ export function createOpensrcAPI(
             return [filePath, "[Error: Path traversal not allowed]"];
           }
 
-          const result = await Result.tryPromise(() => readFile(fullPath, "utf8"));
-
-          return result.match({
-            ok: (content) => [filePath, content],
-            err: (e) => [filePath, `[Error: ${e.message}]`],
-          });
+          try {
+            const content = await readFile(fullPath, "utf8");
+            return [filePath, content];
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return [filePath, `[Error: ${msg}]`];
+          }
         })
       );
 
-      return Result.ok(Object.fromEntries(readResults));
+      return Object.fromEntries(readResults);
     },
   };
 }
