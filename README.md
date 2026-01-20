@@ -34,26 +34,45 @@ Add to your OpenCode config (`~/.config/opencode/config.json` or project `openco
 }
 ```
 
-## Tools
+## Tool
 
-### `search`
+### `execute`
 
-Query fetched sources without consuming context. Data stays server-side.
+Single tool exposing all operations. Agents write JS that runs server-side; only results return.
 
 ```typescript
 // Available in sandbox:
 declare const opensrc: {
+  // Read operations
   list(): Source[];
   has(name: string, version?: string): boolean;
   get(name: string): Source | undefined;
   files(sourceName: string, glob?: string): Promise<FileEntry[]>;
+  tree(sourceName: string, options?: { depth?: number }): Promise<TreeNode>;
   grep(pattern: string, options?: {
     sources?: string[];
     include?: string;
     maxResults?: number;
   }): Promise<GrepResult[]>;
+  astGrep(sourceName: string, pattern: string, options?: {
+    glob?: string;
+    lang?: string | string[];
+    limit?: number;
+  }): Promise<AstGrepMatch[]>;
   read(sourceName: string, filePath: string): Promise<string>;
+  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
   resolve(spec: string): Promise<ParsedSpec>;
+
+  // Mutation operations
+  fetch(specs: string | string[], options?: { modify?: boolean }): Promise<FetchedSource[]>;
+  remove(names: string[]): Promise<RemoveResult>;
+  clean(options?: {
+    packages?: boolean;
+    repos?: boolean;
+    npm?: boolean;
+    pypi?: boolean;
+    crates?: boolean;
+  }): Promise<RemoveResult>;
 };
 
 declare const sources: Source[];  // All fetched sources
@@ -66,43 +85,6 @@ declare const cwd: string;        // Project directory
 // List all fetched sources
 async () => opensrc.list()
 
-// Check if zod is fetched
-async () => opensrc.has("zod")
-
-// Find TypeScript files in zod
-async () => opensrc.files("zod", "**/*.ts")
-
-// Search for "parse" in zod source
-async () => opensrc.grep("parse", { sources: ["zod"], include: "*.ts" })
-
-// Read a specific file
-async () => opensrc.read("zod", "src/index.ts")
-```
-
-### `execute`
-
-Mutations: fetch packages, remove, clean.
-
-```typescript
-declare const opensrc: {
-  fetch(specs: string | string[], options?: {
-    modify?: boolean;
-  }): Promise<FetchResult[]>;
-  remove(names: string[]): Promise<RemoveResult>;
-  clean(options?: {
-    packages?: boolean;
-    repos?: boolean;
-    npm?: boolean;
-    pypi?: boolean;
-    crates?: boolean;
-  }): Promise<RemoveResult>;
-  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
-};
-```
-
-**Examples:**
-
-```javascript
 // Fetch npm package (auto-detects version from lockfile)
 async () => opensrc.fetch("zod")
 
@@ -116,14 +98,29 @@ async () => opensrc.fetch("vercel/ai@v3.0.0")
 async () => opensrc.fetch("pypi:requests")
 async () => opensrc.fetch("crates:serde")
 
+// Get directory tree
+async () => opensrc.tree("zod", { depth: 2 })
+
+// Find TypeScript files
+async () => opensrc.files("zod", "**/*.ts")
+
+// Text search
+async () => opensrc.grep("parse", { sources: ["zod"], include: "*.ts" })
+
+// AST search (structural pattern matching)
+async () => opensrc.astGrep("zod", "function $NAME($$$ARGS)", { glob: "**/*.ts" })
+
+// Read a specific file
+async () => opensrc.read("zod", "src/index.ts")
+
+// Read multiple files (supports globs)
+async () => opensrc.readMany("zod", ["src/index.ts", "packages/*/package.json"])
+
 // Remove a source
 async () => opensrc.remove(["zod"])
 
 // Clean all npm packages
 async () => opensrc.clean({ npm: true })
-
-// Read multiple files at once
-async () => opensrc.readMany("zod", ["src/index.ts", "src/types.ts"])
 ```
 
 ## Package Formats
@@ -141,20 +138,25 @@ async () => opensrc.readMany("zod", ["src/index.ts", "src/types.ts"])
 | `owner/repo@ref` | `vercel/ai@v1.0.0` | GitHub at ref |
 | `github:owner/repo` | `github:facebook/react` | explicit GitHub |
 
-## Output Structure
+## Storage
 
-Sources are stored in `opensrc/` in your project:
+Sources are stored globally at `~/.local/share/opensrc/` (XDG compliant):
 
 ```
-your-project/
-├── opensrc/
-│   ├── sources.json     # Index of fetched sources
-│   └── zod/             # Fetched source code
+~/.local/share/opensrc/
+├── sources.json           # Index of fetched sources
+├── packages/              # npm/pypi/crates packages
+│   └── zod/
 │       ├── src/
 │       ├── package.json
 │       └── ...
-└── ...
+└── repos/                 # GitHub repos
+    └── github.com/
+        └── vercel/
+            └── ai/
 ```
+
+Override with `$OPENSRC_DIR` or `$XDG_DATA_HOME`.
 
 ## How It Works
 

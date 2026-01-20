@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-01-19
-**Commit:** 8127c7d
+**Commit:** 2863d2c
 **Branch:** main
 
 ## OVERVIEW
@@ -14,12 +14,12 @@ MCP server exposing a "codemode" pattern for fetching/querying dependency source
 src/
   index.ts          # Entry point, main(), stdio transport
   server.ts         # MCP server factory, tool registration
-  api/opensrc.ts    # Core API (fetch, read, grep)
+  api/opensrc.ts    # Core API (fetch, read, grep, astGrep, tree)
   executor.ts       # VM sandbox for agent code execution
   errors.ts         # Tagged error types (better-result)
-  types.ts          # Core interfaces (Source, FileEntry, etc.)
-  sources.ts        # sources.json read/write
-  logger.ts         # File logging to ~/.opensrc/logs/
+  types.ts          # Core interfaces (Source, FileEntry, TreeNode, etc.)
+  sources.ts        # sources.json read/write via opensrc lib
+  logger.ts         # JSON file logger to ~/.opensrc/logs/
   config.ts         # Global paths (opensrc dir, logs)
   truncate.ts       # Output size limiting
 opensrc/            # Runtime data (fetched sources) - gitignored
@@ -32,17 +32,22 @@ opensrc/            # Runtime data (fetched sources) - gitignored
 | Add new tool | `server.ts` | Single `execute` tool pattern |
 | Modify API | `api/opensrc.ts` | All ops exposed to sandbox |
 | Error handling | `errors.ts` | TaggedError pattern |
-| Source persistence | `sources.ts` | JSON at ~/.opensrc/sources.json |
+| Source persistence | `sources.ts` | JSON at ~/.local/share/opensrc/ |
+| Add new type | `types.ts` | Core interfaces |
 
 ## CODE MAP
 
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `main` | function | `index.ts:15` | Entry, init server |
+| `main` | function | `index.ts:14` | Entry, init server |
 | `createServer` | function | `server.ts` | MCP server factory |
-| `createOpensrcAPI` | function | `api/opensrc.ts` | API factory for sandbox |
+| `createOpensrcAPI` | function | `api/opensrc.ts:117` | API factory for sandbox |
 | `createExecutor` | function | `executor.ts` | VM sandbox factory |
 | `Source` | interface | `types.ts:4` | Fetched package/repo |
+| `FileEntry` | interface | `types.ts:17` | Dir listing result |
+| `GrepResult` | interface | `types.ts:26` | Text search result |
+| `AstGrepMatch` | interface | `types.ts:63` | AST search result |
+| `TreeNode` | interface | `types.ts:85` | Directory tree node |
 | `TaggedError` | class | `better-result` | Discriminated error union base |
 
 ## CONVENTIONS
@@ -52,6 +57,7 @@ opensrc/            # Runtime data (fetched sources) - gitignored
 - **ESM only**: Use `.js` extensions in imports
 - **No linter**: No eslint/biome configured
 - **tsdown bundler**: Beta bundler, outputs `.mjs`
+- **Dual VCS**: jj colocated with git (`.jj/` present)
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
@@ -61,18 +67,10 @@ opensrc/            # Runtime data (fetched sources) - gitignored
 - **No test framework**: Ad-hoc `test-*.mjs` scripts only
 - **No CI**: No automated testing/linting
 
-## KNOWN ISSUES
-
-| Severity | Issue | Location |
-|----------|-------|----------|
-| HIGH | Path traversal bypass (`....//`) | `api/opensrc.ts:102-107` |
-| MEDIUM | ReDoS via user regex | `api/opensrc.ts:126` |
-| MEDIUM | No memory limits in executor | `executor.ts:33-39` |
-
 ## COMMANDS
 
 ```bash
-npm run build     # tsdown → dist/index.mjs
+npm run build     # tsdown -> dist/index.mjs
 npm run dev       # watch mode
 npm start         # run built server
 node test-mcp.mjs # integration test (spawns server)
@@ -83,3 +81,5 @@ node test-mcp.mjs # integration test (spawns server)
 - **Global state**: Sources list is module singleton
 - **Codemode pattern**: LLMs write JS, server executes, only results return
 - **Graceful shutdown**: SIGINT/SIGTERM write sources
+- **XDG paths**: Data stored in ~/.local/share/opensrc/, logs in ~/.opensrc/logs/
+- **Import JSON assertion**: Uses `with { type: "json" }` (stage 3 proposal)
