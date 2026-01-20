@@ -26,11 +26,25 @@ interface FileEntry {
   isDirectory: boolean;
 }
 
+interface TreeNode {
+  name: string;
+  type: "file" | "dir";
+  children?: TreeNode[];
+}
+
 interface GrepResult {
   source: string;
   file: string;
   line: number;
   content: string;
+}
+
+interface AstGrepMatch {
+  file: string;
+  line: number;
+  column: number;
+  text: string;
+  metavars: Record<string, string>;  // captured $VAR values
 }
 
 interface ParsedSpec {
@@ -60,12 +74,19 @@ declare const opensrc: {
   has(name: string, version?: string): boolean;
   get(name: string): Source | undefined;
   files(sourceName: string, glob?: string): Promise<FileEntry[]>;
+  tree(sourceName: string, options?: { depth?: number }): Promise<TreeNode>;
   grep(pattern: string, options?: {
     sources?: string[];
     include?: string;
     maxResults?: number;
   }): Promise<GrepResult[]>;
+  astGrep(sourceName: string, pattern: string, options?: {
+    glob?: string;
+    lang?: string | string[];
+    limit?: number;
+  }): Promise<AstGrepMatch[]>;
   read(sourceName: string, filePath: string): Promise<string>;
+  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
   resolve(spec: string): Promise<ParsedSpec>;
 
   // Mutation operations
@@ -80,7 +101,6 @@ declare const opensrc: {
     pypi?: boolean;
     crates?: boolean;
   }): Promise<RemoveResult>;
-  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
 };
 `;
 
@@ -108,19 +128,15 @@ async () => {
   return opensrc.list().map(s => ({ name: s.name, type: s.type, version: s.version || s.ref }));
 }
 
-// Fetch a package and explore it
+// Fetch and explore structure with tree()
 async () => {
   const [{ source }] = await opensrc.fetch("zod");
-  // Use source.name for all subsequent calls
-  const files = await opensrc.files(source.name, "src/**/*.ts");
-  return { name: source.name, fileCount: files.length };
+  return await opensrc.tree(source.name, { depth: 2 });
 }
 
 // Fetch a GitHub repo and read key files
 async () => {
   const [{ source }] = await opensrc.fetch("vercel/ai");
-  // Repo names include host: "github.com/vercel/ai"
-  
   const files = await opensrc.readMany(source.name, [
     "package.json",
     "README.md",
@@ -129,57 +145,56 @@ async () => {
   return { sourceName: source.name, files: Object.keys(files) };
 }
 
+// readMany with globs
+async () => {
+  return await opensrc.readMany("zod", ["packages/*/package.json"]);
+}
+
 // Fetch multiple packages
 async () => {
   const results = await opensrc.fetch(["zod", "drizzle-orm", "hono"]);
   return results.map(r => r.source.name);
 }
 
-// Find function definition and read implementation
+// Text search with grep
 async () => {
-  const matches = await opensrc.grep("export function parse", { sources: ["zod"], include: "*.ts" });
+  const results = await opensrc.grep("export function parse", { sources: ["zod"], include: "*.ts" });
   if (matches.length === 0) return "No matches";
-  
   const { source, file, line } = matches[0];
   const content = await opensrc.read(source, file);
-  const lines = content.split("\\n");
-  
-  // Return 30 lines starting from match
-  return lines.slice(line - 1, line + 29).join("\\n");
+  return content.split("\\n").slice(line - 1, line + 29).join("\\n");
 }
 
 // Search across all sources
 async () => {
-  const results = await opensrc.grep("catch|throw new Error", { include: "*.ts", maxResults: 20 });
+  const results = await opensrc.grep("throw new Error", { include: "*.ts", maxResults: 20 });
   return results.map(r => \`\${r.source}:\${r.file}:\${r.line}\`);
 }
 
-// Find entry points in a repo
+// AST search with astGrep (use $VAR for single node, $$$VAR for multiple)
+// Patterns: "function $NAME($$$)" | "const $X = $Y" | "useState($INIT)" | "$OBJ.$METHOD($$$)"
 async () => {
-  const name = "github.com/vercel/ai";
-  const files = await opensrc.files(name, "**/{index,main}.{ts,js}");
-  
-  if (files.length > 0) {
-    return await opensrc.read(name, files[0].path);
-  }
+  const matches = await opensrc.astGrep("zod", "function $NAME($$$ARGS)", { glob: "**/*.ts", limit: 10 });
+  return matches.map(m => ({ file: m.file, name: m.metavars.NAME, line: m.line }));
+}
+
+// Find entry points
+async () => {
+  const files = await opensrc.files("github.com/vercel/ai", "**/{index,main}.{ts,js}");
+  if (files.length > 0) return await opensrc.read("github.com/vercel/ai", files[0].path);
   return "No entry point found";
 }
 
-// Batch read related files
+// Batch read with error handling
 async () => {
-  const files = await opensrc.readMany("zod", [
-    "src/index.ts",
-    "src/types.ts",
-    "src/ZodError.ts"
-  ]);
-  // Files that failed have "[Error: ...]" as value
+  const files = await opensrc.readMany("zod", ["src/index.ts", "src/types.ts", "nonexistent.ts"]);
+  // Failed reads have "[Error: ...]" as value
   return Object.keys(files).filter(p => !files[p].startsWith("[Error:"));
 }
 
 // Remove sources
 async () => {
-  const result = await opensrc.remove(["zod", "github.com/vercel/ai"]);
-  return result.removed;
+  return await opensrc.remove(["zod", "github.com/vercel/ai"]);
 }
 `;
 

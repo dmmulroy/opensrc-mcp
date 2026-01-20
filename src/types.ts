@@ -80,6 +80,15 @@ export interface AstGrepOptions {
 }
 
 /**
+ * Tree node for directory structure visualization
+ */
+export interface TreeNode {
+  name: string;
+  type: "file" | "dir";
+  children?: TreeNode[];
+}
+
+/**
  * Executor result - uses Result for type-safe error handling
  */
 export type { Result } from "better-result";

@@ -2,7 +2,7 @@ import { join, resolve, extname } from "node:path";
 import { readFile } from "node:fs/promises";
 import fg, { type Entry } from "fast-glob";
 import { Lang, parse, type SgNode } from "@ast-grep/napi";
-import type { Source, FileEntry, GrepResult, ParsedSpec, FetchedSource, RemoveResult, AstGrepMatch, AstGrepOptions } from "../types.js";
+import type { Source, FileEntry, GrepResult, ParsedSpec, FetchedSource, RemoveResult, AstGrepMatch, AstGrepOptions, TreeNode } from "../types.js";
 import {
   getOpensrcDir,
   removeSourcesByName,
@@ -83,6 +83,7 @@ export interface OpensrcAPI {
   has(name: string, version?: string): boolean;
   get(name: string): Source | undefined;
   files(sourceName: string, glob?: string): Promise<FileEntry[]>;
+  tree(sourceName: string, options?: { depth?: number; pattern?: string }): Promise<TreeNode>;
   grep(pattern: string, options?: {
     sources?: string[];
     include?: string;
@@ -94,6 +95,7 @@ export interface OpensrcAPI {
     options?: AstGrepOptions
   ): Promise<AstGrepMatch[]>;
   read(sourceName: string, filePath: string): Promise<string>;
+  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
   resolve(spec: string): Promise<ParsedSpec>;
 
   // Mutation operations
@@ -106,7 +108,6 @@ export interface OpensrcAPI {
     pypi?: boolean;
     crates?: boolean;
   }): Promise<RemoveResult>;
-  readMany(sourceName: string, paths: string[]): Promise<Record<string, string>>;
 }
 
 /**
@@ -157,6 +158,77 @@ export function createOpensrcAPI(
         size: e.stats?.size ?? 0,
         isDirectory: e.stats?.isDirectory() ?? false,
       }));
+    },
+
+    tree: async (
+      sourceName: string,
+      options: { depth?: number; pattern?: string } = {}
+    ): Promise<TreeNode> => {
+      const { depth = 3, pattern } = options;
+      const source = getSources().find((s) => s.name === sourceName);
+      if (!source) {
+        throw new Error(`Source not found: ${sourceName}`);
+      }
+
+      const sourcePath = join(opensrcDir, source.path);
+
+      // Get all entries up to depth
+      const globPattern = pattern ?? Array(depth).fill("*").join("/");
+      const entries = await fg([globPattern, ...Array(depth - 1).fill(0).map((_, i) => Array(i + 1).fill("*").join("/"))], {
+        cwd: sourcePath,
+        dot: false,
+        ignore: ["**/node_modules/**", "**/.git/**"],
+        onlyFiles: false,
+        markDirectories: true,
+      });
+
+      // Build tree structure
+      const root: TreeNode = { name: source.name, type: "dir", children: [] };
+      const nodeMap = new Map<string, TreeNode>();
+      nodeMap.set("", root);
+
+      // Sort entries to ensure parents come before children
+      const sortedEntries = [...entries].sort();
+
+      for (const entry of sortedEntries) {
+        const isDir = entry.endsWith("/");
+        const path = isDir ? entry.slice(0, -1) : entry;
+        const parts = path.split("/");
+        const name = parts[parts.length - 1];
+        const parentPath = parts.slice(0, -1).join("/");
+
+        const node: TreeNode = {
+          name,
+          type: isDir ? "dir" : "file",
+          ...(isDir ? { children: [] } : {}),
+        };
+
+        // Find or create parent
+        let parent = nodeMap.get(parentPath);
+        if (!parent) {
+          // Create missing parent directories
+          let currentPath = "";
+          let currentParent = root;
+          for (const part of parts.slice(0, -1)) {
+            currentPath = currentPath ? `${currentPath}/${part}` : part;
+            let existing = nodeMap.get(currentPath);
+            if (!existing) {
+              existing = { name: part, type: "dir", children: [] };
+              nodeMap.set(currentPath, existing);
+              currentParent.children = currentParent.children ?? [];
+              currentParent.children.push(existing);
+            }
+            currentParent = existing;
+          }
+          parent = currentParent;
+        }
+
+        parent.children = parent.children ?? [];
+        parent.children.push(node);
+        nodeMap.set(path, node);
+      }
+
+      return root;
     },
 
     read: async (sourceName: string, filePath: string): Promise<string> => {
@@ -423,8 +495,27 @@ export function createOpensrcAPI(
 
       const sourcePath = resolve(opensrcDir, source.path);
 
+      // Check if path contains glob characters
+      const isGlob = (p: string) => /[*?[\]{}]/.test(p);
+
+      // Expand globs to actual file paths
+      const expandedPaths: string[] = [];
+      for (const p of paths) {
+        if (isGlob(p)) {
+          const matches = await fg(p, {
+            cwd: sourcePath,
+            dot: false,
+            ignore: ["**/node_modules/**", "**/.git/**"],
+            onlyFiles: true,
+          });
+          expandedPaths.push(...matches);
+        } else {
+          expandedPaths.push(p);
+        }
+      }
+
       const readResults = await Promise.all(
-        paths.map(async (filePath): Promise<[string, string]> => {
+        expandedPaths.map(async (filePath): Promise<[string, string]> => {
           const fullPath = resolve(sourcePath, filePath);
 
           // Verify resolved path is within source directory
