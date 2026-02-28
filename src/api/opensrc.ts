@@ -1,4 +1,4 @@
-import { join, resolve, extname } from "node:path";
+import { join, resolve, extname, sep } from "node:path";
 import { readFile } from "node:fs/promises";
 import fg, { type Entry } from "fast-glob";
 import { Lang, parse, type SgNode } from "@ast-grep/napi";
@@ -242,7 +242,7 @@ export function createOpensrcAPI(
       const fullPath = resolve(sourcePath, filePath);
 
       // Verify resolved path is within source directory (path traversal protection)
-      if (!fullPath.startsWith(sourcePath + "/") && fullPath !== sourcePath) {
+      if (!fullPath.startsWith(sourcePath + sep) && fullPath !== sourcePath) {
         throw new Error(`Path traversal not allowed: ${filePath}`);
       }
 
@@ -356,7 +356,7 @@ export function createOpensrcAPI(
           const fullPath = resolve(sourcePath, filePath);
 
           // Path traversal check
-          if (!fullPath.startsWith(sourcePath + "/") && fullPath !== sourcePath) {
+          if (!fullPath.startsWith(sourcePath + sep) && fullPath !== sourcePath) {
             continue;
           }
 
@@ -519,7 +519,7 @@ export function createOpensrcAPI(
           const fullPath = resolve(sourcePath, filePath);
 
           // Verify resolved path is within source directory
-          if (!fullPath.startsWith(sourcePath + "/") && fullPath !== sourcePath) {
+          if (!fullPath.startsWith(sourcePath + sep) && fullPath !== sourcePath) {
             return [filePath, "[Error: Path traversal not allowed]"];
           }
 
